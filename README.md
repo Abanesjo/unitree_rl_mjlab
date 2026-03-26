@@ -173,7 +173,37 @@ cmake .. && make
 
 #### 4.5 Deployment
 
-After Compilation, run：
+## 4.5.1 Simulation Deployment
+
+Before deploying on the real robot, it is recommended to perform simulation deployment using [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco)
+to prevent abnormal behaviors on the physical robot. This framework has already integrated it.
+
+Build unitree_mujoco：
+
+```bash
+cd simulate
+mkdir build && cd build
+cmake .. && make -j8
+```
+
+Launch the simulator (note that a gamepad must be connected):
+
+```bash
+./simulate/build/unitree_mujoco
+```
+
+You can select the corresponding robot in `simulate/config`
+
+Launch the simulation control program:
+
+```bash
+cd deploy/robots/g1/build
+./g1_ctrl --network=lo
+```
+
+## 4.5.2 Real-Robot Deployment
+
+Launch the control program on the real robot:
 
 ```bash
 cd deploy/robots/g1/build
@@ -181,7 +211,7 @@ cd deploy/robots/g1/build
 ```
 
 **Arguments**：
-- `network`: Ethernet interface name (e.g., `enp5s0`)
+- `network`: The network interface used to connect to the robot. Use `lo` for simulation deployment, and `enp5s0` for the real robot(You can check it using the `ifconfig` command) 
 
 </div>
 

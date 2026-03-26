@@ -169,7 +169,36 @@ cmake .. && make
 
 #### 4.5 部署
 
-在编译完成后，执行以下指令：
+## 4.5.1 仿真部署
+
+在实物部署前，建议使用[unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco)进行仿真部署，防止实物机器人出现异常动作。本框架已将其集成。
+
+编译unitree_mujoco：
+
+```bash
+cd simulate
+mkdir build && cd build
+cmake .. && make -j8
+```
+
+启动仿真器(注意此处需连接上手柄才能启动)：
+
+```bash
+./simulate/build/unitree_mujoco
+```
+
+可在 `simulate/config` 中选择对应机器人
+
+启动仿真控制程序：
+
+```bash
+cd deploy/robots/g1/build
+./g1_ctrl --network=lo
+```
+
+## 4.5.2 实物部署
+
+启动实物控制程序：
 
 ```bash
 cd deploy/robots/g1/build
@@ -177,7 +206,7 @@ cd deploy/robots/g1/build
 ```
 
 **参数说明**：
-- `network`: 连接机器人网卡名称，如 `enp5s0`
+- `network`: 连接机器人网卡名称，仿真部署使用 `lo`，实物机器人如 `enp5s0`(可使用 `ifconfig` 指令查看)
 
 </div>
 
