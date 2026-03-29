@@ -407,6 +407,21 @@ class variable_posture:
     return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
 
 
+def track_joint_position(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward for tracking commanded joint positions (exponential kernel)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None, f"Command '{command_name}' not found."
+  current = asset.data.joint_pos[:, asset_cfg.joint_ids]
+  error = torch.mean(torch.square(current - command), dim=1)
+  return torch.exp(-error / std**2)
+
+
 def stand_still(
         env: ManagerBasedRlEnv,
         command_name: str,
