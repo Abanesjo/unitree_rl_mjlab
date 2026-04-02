@@ -210,17 +210,17 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.rewards["body_orientation_l2"].params["asset_cfg"].body_names = ("pelvis",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("pelvis",)
 
-  # --- Stronger push disturbances ---
-  # The policy must handle pushes on top of upper body perturbations.
-  cfg.events["push_robot"].interval_range_s = (1.0, 2.0)
-  cfg.events["push_robot"].params["velocity_range"] = {
-    "x": (-0.8, 0.8),
-    "y": (-0.8, 0.8),
-    "z": (-0.5, 0.5),
-    "roll": (-0.8, 0.8),
-    "pitch": (-0.8, 0.8),
-    "yaw": (-1.0, 1.0),
-  }
+  # --- Stronger push disturbances (removed in play mode by base config) ---
+  if "push_robot" in cfg.events:
+    cfg.events["push_robot"].interval_range_s = (1.0, 2.0)
+    cfg.events["push_robot"].params["velocity_range"] = {
+      "x": (-0.8, 0.8),
+      "y": (-0.8, 0.8),
+      "z": (-0.5, 0.5),
+      "roll": (-0.8, 0.8),
+      "pitch": (-0.8, 0.8),
+      "yaw": (-1.0, 1.0),
+    }
 
   # --- Reduce angular momentum penalty ---
   # Upper body motion generates more angular momentum naturally.
