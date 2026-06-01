@@ -1,10 +1,9 @@
-"""Unitree G1 lower-body-only velocity environment configurations.
+"""Unitree G1 lower-body stationary balance environment configurations.
 
-The policy outputs 12-DOF lower body targets (hips, knees, ankles).
-During training the 8 upper body controlled joints are randomized as
-disturbances and the 9 remaining upper body joints are held at default.
-The policy does not observe upper body targets and receives no reward
-for upper body tracking.
+The policy outputs 12-DOF lower body targets (hips, knees, ankles), plus
+3 auxiliary planar velocity estimates. During training the 8 upper body
+controlled joints are randomized as disturbances and the 9 remaining upper
+body joints are held at default.
 """
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -12,7 +11,6 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 
 import src.tasks.velocity.mdp as mdp
 
@@ -25,6 +23,9 @@ from src.tasks.velocity.mdp.command_driven_action import (
 )
 from src.tasks.velocity.mdp.joint_position_command import (
   UniformJointPositionCommandCfg,
+)
+from src.tasks.velocity.mdp.velocity_estimate_action import (
+  PlanarVelocityEstimateActionCfg,
 )
 
 # Filter G1_ACTION_SCALE to lower body joints only.
@@ -90,16 +91,19 @@ _DISABLED_STD = 100.0
 def unitree_g1_lower_body_rough_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 rough terrain lower-body velocity config."""
+  """Create Unitree G1 rough terrain lower-body stationary config."""
   cfg = unitree_g1_rough_env_cfg(play=play)
 
-  # --- Replace action space: lower body from policy, upper body from command ---
+  # --- Replace action space: legs from policy, plus auxiliary velocity estimate ---
   cfg.actions = {
     "joint_pos": JointPositionActionCfg(
       entity_name="robot",
       actuator_names=(".*_hip_.*", ".*_knee_.*", ".*_ankle_.*"),
       scale=G1_LOWER_BODY_ACTION_SCALE,
       use_default_offset=True,
+    ),
+    "planar_velocity_estimate": PlanarVelocityEstimateActionCfg(
+      entity_name="robot",
     ),
     "upper_body_ctrl": CommandDrivenJointPositionActionCfg(
       entity_name="robot",
@@ -109,7 +113,8 @@ def unitree_g1_lower_body_rough_env_cfg(
     ),
   }
 
-  # --- Add upper body joint position command (disturbance generator) ---
+  # --- Replace commands: only upper-body joint position disturbances remain ---
+  cfg.commands = {}
   cfg.commands["upper_body"] = UniformJointPositionCommandCfg(
     entity_name="robot",
     joint_names=CONTROLLED_JOINTS,
@@ -119,72 +124,98 @@ def unitree_g1_lower_body_rough_env_cfg(
     debug_vis=False,
   )
 
-  # --- Add upper body targets to observations (for anticipation, not control) ---
-  cfg.observations["actor"].terms["upper_body_command"] = ObservationTermCfg(
-    func=mdp.generated_commands,
-    params={"command_name": "upper_body"},
+  # --- Remove locomotion observations and expose upper-body command only ---
+  for group in ("actor", "critic"):
+    terms = cfg.observations[group].terms
+    terms.pop("command", None)
+    terms.pop("phase", None)
+    terms["actions"].params = {"action_name": "joint_pos"}
+    terms["upper_body_command"] = ObservationTermCfg(
+      func=mdp.generated_commands,
+      params={"command_name": "upper_body"},
+    )
+
+  # --- Remove locomotion command curriculum ---
+  cfg.curriculum = {}
+  if cfg.scene.terrain is not None and cfg.scene.terrain.terrain_generator is not None:
+    cfg.scene.terrain.terrain_generator.curriculum = False
+
+  # Spawn exactly at each environment origin so the stationary target is explicit.
+  cfg.events["reset_base"].params["pose_range"]["x"] = (0.0, 0.0)
+  cfg.events["reset_base"].params["pose_range"]["y"] = (0.0, 0.0)
+
+  # --- Replace locomotion rewards with stationary balance rewards ---
+  for reward_name in (
+    "track_linear_velocity",
+    "track_angular_velocity",
+    "foot_gait",
+    "foot_clearance",
+  ):
+    cfg.rewards.pop(reward_name, None)
+
+  cfg.rewards["root_xy_displacement_l2"] = RewardTermCfg(
+    func=mdp.root_xy_displacement_l2,
+    weight=-10.0,
+    params={"asset_cfg": SceneEntityCfg("robot")},
   )
-  cfg.observations["critic"].terms["upper_body_command"] = ObservationTermCfg(
-    func=mdp.generated_commands,
-    params={"command_name": "upper_body"},
+  cfg.rewards["root_planar_velocity_l2"] = RewardTermCfg(
+    func=mdp.root_planar_velocity_l2,
+    weight=-1.0,
+    params={"asset_cfg": SceneEntityCfg("robot")},
+  )
+  cfg.rewards["track_planar_velocity_estimate"] = RewardTermCfg(
+    func=mdp.track_planar_velocity_estimate,
+    weight=0.5,
+    params={
+      "action_name": "planar_velocity_estimate",
+      "std": 0.5,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
+  )
+  cfg.rewards["action_rate_l2"] = RewardTermCfg(
+    func=mdp.action_term_rate_l2,
+    weight=cfg.rewards["action_rate_l2"].weight,
+    params={"action_name": "joint_pos"},
   )
 
-  # NOTE: track_upper_body reward is deliberately NOT added.
-
-  # --- Pose penalty: loosen lower body to allow CoG adaptation ---
+  # --- Pose reward: loosen lower body to allow CoG adaptation ---
   # The upper body is randomly perturbed, so the policy needs freedom to
-  # bend knees, shift hips, and adjust ankles to compensate — not just
-  # during locomotion but also while standing still.
-  cfg.rewards["pose"].params["std_standing"] = {
-    # Lower body -- loosened to allow adaptive balance.
-    r".*_hip_pitch_joint": 0.3,
-    r".*_hip_roll_joint": 0.2,
-    r".*_hip_yaw_joint": 0.15,
-    r".*_knee_joint": 0.3,
-    r".*_ankle_pitch_joint": 0.2,
-    r".*_ankle_roll_joint": 0.15,
-    # All upper body -- effectively disabled.
-    r"waist_yaw_joint": _DISABLED_STD,
-    r"waist_roll_joint": _DISABLED_STD,
-    r"waist_pitch_joint": _DISABLED_STD,
-    r".*_shoulder_pitch_joint": _DISABLED_STD,
-    r".*_shoulder_roll_joint": _DISABLED_STD,
-    r".*_shoulder_yaw_joint": _DISABLED_STD,
-    r".*_elbow_joint": _DISABLED_STD,
-    r".*_wrist_roll_joint": _DISABLED_STD,
-    r".*_wrist_pitch_joint": _DISABLED_STD,
-    r".*_wrist_yaw_joint": _DISABLED_STD,
-  }
-  cfg.rewards["pose"].params["std_walking"] = {
-    r".*hip_pitch.*": 0.5,
-    r".*hip_roll.*": 0.3,
-    r".*hip_yaw.*": 0.25,
-    r".*knee.*": 0.5,
-    r".*ankle_pitch.*": 0.3,
-    r".*ankle_roll.*": 0.2,
-    # All upper body -- effectively disabled.
-    r".*waist.*": _DISABLED_STD,
-    r".*shoulder.*": _DISABLED_STD,
-    r".*elbow.*": _DISABLED_STD,
-    r".*wrist.*": _DISABLED_STD,
-  }
-  cfg.rewards["pose"].params["std_running"] = {
-    r".*hip_pitch.*": 0.5,
-    r".*hip_roll.*": 0.4,
-    r".*hip_yaw.*": 0.3,
-    r".*knee.*": 0.5,
-    r".*ankle_pitch.*": 0.4,
-    r".*ankle_roll.*": 0.2,
-    # All upper body -- effectively disabled.
-    r".*waist.*": _DISABLED_STD,
-    r".*shoulder.*": _DISABLED_STD,
-    r".*elbow.*": _DISABLED_STD,
-    r".*wrist.*": _DISABLED_STD,
-  }
+  # bend knees, shift hips, and adjust ankles to compensate.
+  cfg.rewards["pose"] = RewardTermCfg(
+    func=mdp.default_joint_position,
+    weight=cfg.rewards["pose"].weight,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+      "std": {
+        # Lower body -- loosened to allow adaptive balance.
+        r".*_hip_pitch_joint": 0.3,
+        r".*_hip_roll_joint": 0.2,
+        r".*_hip_yaw_joint": 0.15,
+        r".*_knee_joint": 0.3,
+        r".*_ankle_pitch_joint": 0.2,
+        r".*_ankle_roll_joint": 0.15,
+        # All upper body -- effectively disabled.
+        r"waist_yaw_joint": _DISABLED_STD,
+        r"waist_roll_joint": _DISABLED_STD,
+        r"waist_pitch_joint": _DISABLED_STD,
+        r".*_shoulder_pitch_joint": _DISABLED_STD,
+        r".*_shoulder_roll_joint": _DISABLED_STD,
+        r".*_shoulder_yaw_joint": _DISABLED_STD,
+        r".*_elbow_joint": _DISABLED_STD,
+        r".*_wrist_roll_joint": _DISABLED_STD,
+        r".*_wrist_pitch_joint": _DISABLED_STD,
+        r".*_wrist_yaw_joint": _DISABLED_STD,
+      },
+    },
+  )
 
   # --- Restrict stand_still to lower body only ---
-  cfg.rewards["stand_still"].params["asset_cfg"] = SceneEntityCfg(
-    "robot", joint_names=LOWER_BODY_JOINT_PATTERNS,
+  cfg.rewards["stand_still"] = RewardTermCfg(
+    func=mdp.stand_still,
+    weight=cfg.rewards["stand_still"].weight,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
+    },
   )
 
   # --- Restrict joint_acc_l2 to lower body ---
@@ -192,7 +223,9 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.rewards["joint_acc_l2"] = RewardTermCfg(
     func=cfg.rewards["joint_acc_l2"].func,
     weight=cfg.rewards["joint_acc_l2"].weight,
-    params={"asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)},
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
+    },
   )
 
   # --- Restrict joint_pos_limits to lower body ---
@@ -200,7 +233,24 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.rewards["joint_pos_limits"] = RewardTermCfg(
     func=cfg.rewards["joint_pos_limits"].func,
     weight=cfg.rewards["joint_pos_limits"].weight,
-    params={"asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)},
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
+    },
+  )
+
+  # --- Make foot penalties command-free ---
+  cfg.rewards["foot_slip"] = RewardTermCfg(
+    func=mdp.feet_slip,
+    weight=cfg.rewards["foot_slip"].weight,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": cfg.rewards["foot_slip"].params["asset_cfg"],
+    },
+  )
+  cfg.rewards["soft_landing"] = RewardTermCfg(
+    func=mdp.soft_landing,
+    weight=cfg.rewards["soft_landing"].weight,
+    params={"sensor_name": "feet_ground_contact"},
   )
 
   # --- Use pelvis instead of torso for orientation/ang_vel rewards ---
@@ -232,7 +282,7 @@ def unitree_g1_lower_body_rough_env_cfg(
 def unitree_g1_lower_body_flat_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 flat terrain lower-body velocity config."""
+  """Create Unitree G1 flat terrain lower-body stationary config."""
   cfg = unitree_g1_lower_body_rough_env_cfg(play=play)
 
   cfg.sim.njmax = 300
@@ -252,14 +302,7 @@ def unitree_g1_lower_body_flat_env_cfg(
   for group in ("actor", "critic"):
     cfg.observations[group].terms.pop("height_scan", None)
 
-  # Disable terrain curriculum.
-  cfg.curriculum.pop("terrain_levels", None)
-
-  if play:
-    twist_cmd = cfg.commands["twist"]
-    assert isinstance(twist_cmd, UniformVelocityCommandCfg)
-    twist_cmd.ranges.lin_vel_x = (-0.5, 1.0)
-    twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
-    twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
+  # No terrain or velocity-command curriculum for the stationary task.
+  cfg.curriculum = {}
 
   return cfg

@@ -60,6 +60,74 @@ def track_angular_velocity(
   return torch.exp(-ang_vel_error / std**2)
 
 
+def root_xy_displacement_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize horizontal root displacement from the environment origin."""
+  asset: Entity = env.scene[asset_cfg.name]
+  xy_error = asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+  displacement = torch.norm(xy_error, dim=1)
+  env.extras["log"]["Metrics/root_xy_displacement_mean"] = torch.mean(displacement)
+  return torch.sum(torch.square(xy_error), dim=1)
+
+
+def root_planar_velocity_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize base-frame planar root velocity [vx, vy, wz]."""
+  asset: Entity = env.scene[asset_cfg.name]
+  linear_xy = asset.data.root_link_lin_vel_b[:, :2]
+  yaw_rate = asset.data.root_link_ang_vel_b[:, 2:3]
+  planar_velocity = torch.cat((linear_xy, yaw_rate), dim=1)
+  speed = torch.norm(planar_velocity, dim=1)
+  env.extras["log"]["Metrics/root_planar_speed_mean"] = torch.mean(speed)
+  return torch.sum(torch.square(planar_velocity), dim=1)
+
+
+def track_planar_velocity_estimate(
+  env: ManagerBasedRlEnv,
+  action_name: str,
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward a no-op action head for estimating [vx_b, vy_b, wz_b]."""
+  asset: Entity = env.scene[asset_cfg.name]
+  estimate = env.action_manager.get_term(action_name).raw_action
+  true_velocity = torch.cat(
+    (
+      asset.data.root_link_lin_vel_b[:, :2],
+      asset.data.root_link_ang_vel_b[:, 2:3],
+    ),
+    dim=1,
+  )
+  error = torch.mean(torch.square(estimate - true_velocity), dim=1)
+  env.extras["log"]["Metrics/planar_velocity_estimate_error_mean"] = torch.mean(
+    torch.sqrt(error)
+  )
+  return torch.exp(-error / std**2)
+
+
+def action_term_rate_l2(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Penalize action rate for one named action term only."""
+  start = 0
+  for name, dim in zip(
+    env.action_manager.active_terms, env.action_manager.action_term_dim
+  ):
+    end = start + dim
+    if name == action_name:
+      return torch.sum(
+        torch.square(
+          env.action_manager.action[:, start:end]
+          - env.action_manager.prev_action[:, start:end]
+        ),
+        dim=1,
+      )
+    start = end
+  raise KeyError(f"Action term '{action_name}' not found.")
+
+
 def body_orientation_l2(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -267,19 +335,21 @@ class feet_swing_height:
 def feet_slip(
   env: ManagerBasedRlEnv,
   sensor_name: str,
-  command_name: str,
+  command_name: str | None = None,
   command_threshold: float = 0.01,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """Penalize foot sliding (xy velocity while in contact)."""
   asset: Entity = env.scene[asset_cfg.name]
   contact_sensor: ContactSensor = env.scene[sensor_name]
-  command = env.command_manager.get_command(command_name)
-  assert command is not None
-  linear_norm = torch.norm(command[:, :2], dim=1)
-  angular_norm = torch.abs(command[:, 2])
-  total_command = linear_norm + angular_norm
-  active = (total_command > command_threshold).float()
+  active = 1.0
+  if command_name is not None:
+    command = env.command_manager.get_command(command_name)
+    if command is not None:
+      linear_norm = torch.norm(command[:, :2], dim=1)
+      angular_norm = torch.abs(command[:, 2])
+      total_command = linear_norm + angular_norm
+      active = (total_command > command_threshold).float()
   assert contact_sensor.data.found is not None
   in_contact = (contact_sensor.data.found > 0).float()  # [B, N]
   foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, N, 2]
@@ -407,6 +477,37 @@ class variable_posture:
     return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
 
 
+class default_joint_position:
+  """Reward staying near default joint positions with per-joint tolerances."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+    default_joint_pos = asset.data.default_joint_pos
+    assert default_joint_pos is not None
+    self.default_joint_pos = default_joint_pos
+
+    _, joint_names = asset.find_joints(cfg.params["asset_cfg"].joint_names)
+    _, _, std = resolve_matching_names_values(
+      data=cfg.params["std"],
+      list_of_strings=joint_names,
+    )
+    self.std = torch.tensor(std, device=env.device, dtype=torch.float32)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    std,
+    asset_cfg: SceneEntityCfg,
+  ) -> torch.Tensor:
+    del std  # Resolved once in __init__.
+
+    asset: Entity = env.scene[asset_cfg.name]
+    current_joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    desired_joint_pos = self.default_joint_pos[:, asset_cfg.joint_ids]
+    error_squared = torch.square(current_joint_pos - desired_joint_pos)
+    return torch.exp(-torch.mean(error_squared / (self.std**2), dim=1))
+
+
 def track_joint_position(
   env: ManagerBasedRlEnv,
   command_name: str,
@@ -423,21 +524,23 @@ def track_joint_position(
 
 
 def stand_still(
-        env: ManagerBasedRlEnv,
-        command_name: str,
-        command_threshold: float = 0.1,
-        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  command_name: str | None = None,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    asset: Entity = env.scene[asset_cfg.name]
-    diff_angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
-    reward = torch.sum(torch.square(diff_angle), dim=1)
-    if command_name is not None:
-        command = env.command_manager.get_command(command_name)
-        if command is not None:
-            linear_norm = torch.norm(command[:, :2], dim=1)
-            angular_norm = torch.abs(command[:, 2])
-            total_command = linear_norm + angular_norm
-            scale = (total_command <= command_threshold).float()
-            reward *= scale
-    return reward
-
+  asset: Entity = env.scene[asset_cfg.name]
+  diff_angle = (
+    asset.data.joint_pos[:, asset_cfg.joint_ids]
+    - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+  )
+  reward = torch.sum(torch.square(diff_angle), dim=1)
+  if command_name is not None:
+    command = env.command_manager.get_command(command_name)
+    if command is not None:
+      linear_norm = torch.norm(command[:, :2], dim=1)
+      angular_norm = torch.abs(command[:, 2])
+      total_command = linear_norm + angular_norm
+      scale = (total_command <= command_threshold).float()
+      reward *= scale
+  return reward

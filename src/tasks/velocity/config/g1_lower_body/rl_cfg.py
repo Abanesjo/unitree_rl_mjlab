@@ -1,4 +1,4 @@
-"""RL configuration for Unitree G1 lower-body velocity task."""
+"""RL configuration for Unitree G1 lower-body stationary balance task."""
 
 from mjlab.rl import (
   RslRlModelCfg,
@@ -8,7 +8,7 @@ from mjlab.rl import (
 
 
 def unitree_g1_lower_body_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """Create RL runner configuration for Unitree G1 lower-body velocity task."""
+  """Create RL runner configuration for Unitree G1 lower-body stationary task."""
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
@@ -39,7 +39,7 @@ def unitree_g1_lower_body_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    experiment_name="g1_velocity_lower_body",
+    experiment_name="g1_stationary_lower_body",
     save_interval=100,
     num_steps_per_env=24,
     max_iterations=10001,
