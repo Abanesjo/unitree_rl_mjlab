@@ -86,6 +86,76 @@ def root_planar_velocity_l2(
   return torch.sum(torch.square(planar_velocity), dim=1)
 
 
+def com_support_box_violation(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  foot_half_length: float,
+  foot_half_width: float,
+  margin: float = 0.0,
+  no_contact_penalty: float = 1.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize projected COM outside the contacted feet's support box.
+
+  This uses a simple axis-aligned world-XY box around the contacted foot sites.
+  The COM is MuJoCo's subtree COM for the robot root body.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  assert contact_sensor.data.found is not None
+
+  root_body_id = asset.data.indexing.root_body_id
+  com_xy = asset.data.data.subtree_com[:, root_body_id, :2]
+  if com_xy.ndim == 3:
+    com_xy = com_xy.squeeze(1)
+
+  foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]
+  effective_half_length = max(foot_half_length - margin, 0.0)
+  effective_half_width = max(foot_half_width - margin, 0.0)
+  half_extents = torch.tensor(
+    (effective_half_length, effective_half_width),
+    device=env.device,
+    dtype=foot_xy.dtype,
+  )
+  foot_min = foot_xy - half_extents
+  foot_max = foot_xy + half_extents
+
+  contact = contact_sensor.data.found > 0
+  if contact.ndim == 3:
+    contact = contact.squeeze(-1)
+  contact = contact[:, : foot_xy.shape[1]]
+  has_support = torch.any(contact, dim=1)
+
+  contact_expanded = contact.unsqueeze(-1)
+  support_min = torch.min(
+    torch.where(contact_expanded, foot_min, torch.full_like(foot_min, float("inf"))),
+    dim=1,
+  ).values
+  support_max = torch.max(
+    torch.where(contact_expanded, foot_max, torch.full_like(foot_max, -float("inf"))),
+    dim=1,
+  ).values
+
+  support_min = torch.where(has_support.unsqueeze(1), support_min, com_xy)
+  support_max = torch.where(has_support.unsqueeze(1), support_max, com_xy)
+  outside = torch.relu(support_min - com_xy) + torch.relu(com_xy - support_max)
+  violation = torch.sum(torch.square(outside), dim=1)
+  violation = torch.where(
+    has_support,
+    violation,
+    violation + torch.full_like(violation, no_contact_penalty),
+  )
+
+  outside_distance = torch.sqrt(torch.sum(torch.square(outside), dim=1))
+  env.extras["log"]["Metrics/com_support_outside_distance_mean"] = torch.mean(
+    outside_distance
+  )
+  env.extras["log"]["Metrics/support_contact_count_mean"] = torch.mean(
+    contact.float().sum(dim=1)
+  )
+  return violation
+
+
 def track_planar_velocity_estimate(
   env: ManagerBasedRlEnv,
   action_name: str,

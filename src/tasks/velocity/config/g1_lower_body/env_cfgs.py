@@ -93,6 +93,7 @@ def unitree_g1_lower_body_rough_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
   """Create Unitree G1 rough terrain lower-body stationary config."""
   cfg = unitree_g1_rough_env_cfg(play=play)
+  cfg.sim.nconmax = None
 
   # --- Replace action space: legs from policy, plus auxiliary velocity estimate ---
   cfg.actions = {
@@ -163,6 +164,19 @@ def unitree_g1_lower_body_rough_env_cfg(
     weight=-1.0,
     params={"asset_cfg": SceneEntityCfg("robot")},
   )
+  cfg.rewards["com_support_box_violation"] = RewardTermCfg(
+    func=mdp.com_support_box_violation,
+    weight=-20.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+      ),
+      "foot_half_length": 0.10,
+      "foot_half_width": 0.04,
+      "margin": 0.02,
+    },
+  )
   cfg.rewards["track_planar_velocity_estimate"] = RewardTermCfg(
     func=mdp.track_planar_velocity_estimate,
     weight=0.5,
@@ -183,17 +197,17 @@ def unitree_g1_lower_body_rough_env_cfg(
   # bend knees, shift hips, and adjust ankles to compensate.
   cfg.rewards["pose"] = RewardTermCfg(
     func=mdp.default_joint_position,
-    weight=cfg.rewards["pose"].weight,
+    weight=0.5,
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
       "std": {
         # Lower body -- loosened to allow adaptive balance.
-        r".*_hip_pitch_joint": 0.3,
-        r".*_hip_roll_joint": 0.2,
-        r".*_hip_yaw_joint": 0.15,
-        r".*_knee_joint": 0.3,
-        r".*_ankle_pitch_joint": 0.2,
-        r".*_ankle_roll_joint": 0.15,
+        r".*_hip_pitch_joint": 0.6,
+        r".*_hip_roll_joint": 0.35,
+        r".*_hip_yaw_joint": 0.25,
+        r".*_knee_joint": 0.7,
+        r".*_ankle_pitch_joint": 0.5,
+        r".*_ankle_roll_joint": 0.25,
         # All upper body -- effectively disabled.
         r"waist_yaw_joint": _DISABLED_STD,
         r"waist_roll_joint": _DISABLED_STD,
@@ -212,7 +226,7 @@ def unitree_g1_lower_body_rough_env_cfg(
   # --- Restrict stand_still to lower body only ---
   cfg.rewards["stand_still"] = RewardTermCfg(
     func=mdp.stand_still,
-    weight=cfg.rewards["stand_still"].weight,
+    weight=-0.1,
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
     },
