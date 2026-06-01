@@ -102,6 +102,39 @@ public:
     }
 };
 
+class SmoothedJointPositionAction : public JointAction
+{
+public:
+    SmoothedJointPositionAction(YAML::Node cfg, ManagerBasedRLEnv* env)
+    :JointAction(cfg, env)
+    {
+        _smoothed_actions = _offset.empty() ? std::vector<float>(_action_dim, 0.0f) : _offset;
+        if(!cfg["smoothing_alpha"].IsNull()) {
+            _alpha = cfg["smoothing_alpha"].as<float>();
+        }
+    }
+
+    void process_actions(std::vector<float> actions) override
+    {
+        JointAction::process_actions(actions);
+        for(int i(0); i<_action_dim; ++i)
+        {
+            _smoothed_actions[i] = _alpha * _processed_actions[i] + (1.0f - _alpha) * _smoothed_actions[i];
+            _processed_actions[i] = _smoothed_actions[i];
+        }
+    }
+
+    void reset() override
+    {
+        JointAction::reset();
+        _smoothed_actions = _offset.empty() ? std::vector<float>(_action_dim, 0.0f) : _offset;
+    }
+
+private:
+    float _alpha = 0.55f;
+    std::vector<float> _smoothed_actions;
+};
+
 class JointVelocityAction : public JointAction
 {
 public:
@@ -112,6 +145,7 @@ public:
 };
 
 REGISTER_ACTION(JointPositionAction);
+REGISTER_ACTION(SmoothedJointPositionAction);
 REGISTER_ACTION(JointVelocityAction);
 
 };

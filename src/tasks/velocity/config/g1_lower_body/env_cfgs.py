@@ -1,80 +1,96 @@
-"""Unitree G1 lower-body stationary balance environment configurations.
+"""Unitree G1 lower-body balance environment configurations.
 
-The policy outputs 12-DOF lower body targets (hips, knees, ankles), plus
-3 auxiliary planar velocity estimates. During training the 8 upper body
-controlled joints are randomized as disturbances and the 9 remaining upper
-body joints are held at default.
+The policy outputs 12 lower-body joint targets plus 3 no-op auxiliary planar
+velocity estimates. Upper-body joints are driven by a separate PD action from
+smooth disturbance commands and are never controlled by the policy.
 """
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers import TerminationTermCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.sensor import ContactMatch, ContactSensorCfg
 
 import src.tasks.velocity.mdp as mdp
 
-from src.assets.robots import G1_ACTION_SCALE
 from src.tasks.velocity.config.g1.env_cfgs import (
   unitree_g1_rough_env_cfg,
 )
 from src.tasks.velocity.mdp.command_driven_action import (
   CommandDrivenJointPositionActionCfg,
 )
-from src.tasks.velocity.mdp.joint_position_command import (
-  UniformJointPositionCommandCfg,
+from src.tasks.velocity.mdp.smoothed_joint_position_action import (
+  SmoothedJointPositionActionCfg,
+)
+from src.tasks.velocity.mdp.upper_body_disturbance_command import (
+  UpperBodyDisturbanceCommandCfg,
 )
 from src.tasks.velocity.mdp.velocity_estimate_action import (
   PlanarVelocityEstimateActionCfg,
 )
 
-# Filter G1_ACTION_SCALE to lower body joints only.
-# resolve_matching_names_values requires every pattern to match at least one
-# target, so we cannot pass the full 29-DOF scale dict to a 12-DOF action term.
 G1_LOWER_BODY_ACTION_SCALE = {
-  k: v for k, v in G1_ACTION_SCALE.items()
-  if any(p in k for p in ("hip", "knee", "ankle"))
+  r".*_hip_pitch_joint": 0.70,
+  r".*_hip_roll_joint": 0.45,
+  r".*_hip_yaw_joint": 0.30,
+  r".*_knee_joint": 0.90,
+  r".*_ankle_pitch_joint": 0.55,
+  r".*_ankle_roll_joint": 0.25,
 }
 
 # ---------------------------------------------------------------------------
 # Joint groupings
 # ---------------------------------------------------------------------------
 
-# Upper body joints whose positions are randomized as disturbances.
-CONTROLLED_JOINTS = (
+# Upper body joints driven by the separate PD controller.
+UPPER_BODY_JOINTS = (
+  "waist_yaw_joint",
   "waist_roll_joint",
   "waist_pitch_joint",
   "left_shoulder_pitch_joint",
   "left_shoulder_roll_joint",
-  "left_elbow_joint",
-  "right_shoulder_pitch_joint",
-  "right_shoulder_roll_joint",
-  "right_elbow_joint",
-)
-
-# Sampling ranges for each controlled joint (~80% of joint limits).
-CONTROLLED_JOINT_RANGES = {
-  "waist_roll_joint": (-0.40, 0.40),
-  "waist_pitch_joint": (-0.40, 0.40),
-  "left_shoulder_pitch_joint": (-2.0, 2.0),
-  "left_shoulder_roll_joint": (-1.0, 1.8),
-  "left_elbow_joint": (-0.8, 1.7),
-  "right_shoulder_pitch_joint": (-2.0, 2.0),
-  "right_shoulder_roll_joint": (-1.8, 1.0),
-  "right_elbow_joint": (-0.8, 1.7),
-}
-
-# Upper body joints held at their default (home) position.
-FIXED_UPPER_BODY_JOINTS = (
-  "waist_yaw_joint",
   "left_shoulder_yaw_joint",
-  "right_shoulder_yaw_joint",
+  "left_elbow_joint",
   "left_wrist_roll_joint",
   "left_wrist_pitch_joint",
   "left_wrist_yaw_joint",
+  "right_shoulder_pitch_joint",
+  "right_shoulder_roll_joint",
+  "right_shoulder_yaw_joint",
+  "right_elbow_joint",
   "right_wrist_roll_joint",
   "right_wrist_pitch_joint",
   "right_wrist_yaw_joint",
+)
+
+# Sampling ranges for each upper-body joint. These are intentionally narrower
+# than hard XML limits to avoid training mostly on self-colliding postures.
+UPPER_BODY_JOINT_RANGES = {
+  "waist_yaw_joint": (-0.60, 0.60),
+  "waist_roll_joint": (-0.40, 0.40),
+  "waist_pitch_joint": (-0.40, 0.40),
+  "left_shoulder_pitch_joint": (-2.0, 2.0),
+  "left_shoulder_roll_joint": (-1.1, 1.6),
+  "left_shoulder_yaw_joint": (-1.2, 1.2),
+  "left_elbow_joint": (-0.7, 1.8),
+  "left_wrist_roll_joint": (-0.5, 0.5),
+  "left_wrist_pitch_joint": (-0.5, 0.5),
+  "left_wrist_yaw_joint": (-0.5, 0.5),
+  "right_shoulder_pitch_joint": (-2.0, 2.0),
+  "right_shoulder_roll_joint": (-1.6, 1.1),
+  "right_shoulder_yaw_joint": (-1.2, 1.2),
+  "right_elbow_joint": (-0.7, 1.8),
+  "right_wrist_roll_joint": (-0.5, 0.5),
+  "right_wrist_pitch_joint": (-0.5, 0.5),
+  "right_wrist_yaw_joint": (-0.5, 0.5),
+}
+
+FOOT_SITE_NAMES = ("left_foot", "right_foot")
+FOOT_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
+FOOT_GEOM_NAMES = tuple(
+  f"{side}_foot{i}_collision" for side in ("left", "right") for i in range(1, 8)
 )
 
 # Lower body joint patterns (for reward filtering).
@@ -95,13 +111,31 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg = unitree_g1_rough_env_cfg(play=play)
   cfg.sim.nconmax = None
 
+  nonfoot_ground_cfg = ContactSensorCfg(
+    name="nonfoot_ground_touch",
+    primary=ContactMatch(
+      mode="geom",
+      entity="robot",
+      pattern=r".*_collision\d*$",
+      exclude=FOOT_GEOM_NAMES,
+    ),
+    secondary=ContactMatch(mode="body", pattern="terrain"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=1,
+    history_length=4,
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (nonfoot_ground_cfg,)
+
   # --- Replace action space: legs from policy, plus auxiliary velocity estimate ---
   cfg.actions = {
-    "joint_pos": JointPositionActionCfg(
+    "joint_pos": SmoothedJointPositionActionCfg(
       entity_name="robot",
       actuator_names=(".*_hip_.*", ".*_knee_.*", ".*_ankle_.*"),
       scale=G1_LOWER_BODY_ACTION_SCALE,
       use_default_offset=True,
+      smoothing_alpha_range=(0.55, 0.55) if play else (0.40, 0.70),
+      delay_steps_range=(0, 0) if play else (0, 3),
     ),
     "planar_velocity_estimate": PlanarVelocityEstimateActionCfg(
       entity_name="robot",
@@ -109,19 +143,24 @@ def unitree_g1_lower_body_rough_env_cfg(
     "upper_body_ctrl": CommandDrivenJointPositionActionCfg(
       entity_name="robot",
       command_name="upper_body",
-      commanded_joint_names=CONTROLLED_JOINTS,
-      fixed_joint_names=FIXED_UPPER_BODY_JOINTS,
+      commanded_joint_names=UPPER_BODY_JOINTS,
     ),
   }
 
-  # --- Replace commands: only upper-body joint position disturbances remain ---
+  # --- Replace commands: upper-body joint-position disturbances only ---
   cfg.commands = {}
-  cfg.commands["upper_body"] = UniformJointPositionCommandCfg(
+  cfg.commands["upper_body"] = UpperBodyDisturbanceCommandCfg(
     entity_name="robot",
-    joint_names=CONTROLLED_JOINTS,
-    resampling_time_range=(3.0, 8.0),
-    rel_default_envs=0.05,
-    ranges=CONTROLLED_JOINT_RANGES,
+    joint_names=UPPER_BODY_JOINTS,
+    resampling_time_range=(3.0, 6.0),
+    rel_default_envs=0.10,
+    ranges=UPPER_BODY_JOINT_RANGES,
+    mode_probabilities=(1.0, 0.0, 0.0, 0.0),
+    amplitude_scale=0.20,
+    random_walk_velocity_range=(0.05, 0.20),
+    random_walk_acceleration_range=(0.10, 0.60),
+    sinusoid_frequency_range=(0.25, 0.80),
+    pulse_duration_range=(0.60, 1.60),
     debug_vis=False,
   )
 
@@ -135,15 +174,94 @@ def unitree_g1_lower_body_rough_env_cfg(
       func=mdp.generated_commands,
       params={"command_name": "upper_body"},
     )
+    terms["foot_pos_b"] = ObservationTermCfg(
+      func=mdp.foot_pos_b,
+      params={"asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES)},
+    )
+    terms["foot_vel_b"] = ObservationTermCfg(
+      func=mdp.foot_vel_b,
+      params={"asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES)},
+    )
 
-  # --- Remove locomotion command curriculum ---
-  cfg.curriculum = {}
+  cfg.observations["actor"].history_length = 6
+  cfg.observations["critic"].history_length = 1
+  cfg.observations["critic"].terms["whole_body_com_b"] = ObservationTermCfg(
+    func=mdp.whole_body_com_b,
+    params={"asset_cfg": SceneEntityCfg("robot")},
+  )
+  cfg.observations["critic"].terms["root_planar_velocity"] = ObservationTermCfg(
+    func=mdp.root_planar_velocity,
+    params={"asset_cfg": SceneEntityCfg("robot")},
+  )
+
   if cfg.scene.terrain is not None and cfg.scene.terrain.terrain_generator is not None:
     cfg.scene.terrain.terrain_generator.curriculum = False
+
+  if play:
+    cfg.curriculum = {}
+  else:
+    cfg.curriculum = {
+      "upper_body_disturbance": CurriculumTermCfg(
+        func=mdp.upper_body_disturbance,
+        params={
+          "command_name": "upper_body",
+          "stages": [
+            {
+              "step": 0,
+              "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
+              "amplitude_scale": 0.20,
+              "resampling_time_range": (3.0, 6.0),
+            },
+            {
+              "step": 1000 * 48,
+              "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
+              "amplitude_scale": 0.45,
+              "resampling_time_range": (2.5, 5.0),
+            },
+            {
+              "step": 2500 * 48,
+              "mode_probabilities": (0.45, 0.35, 0.15, 0.05),
+              "amplitude_scale": 0.60,
+              "random_walk_velocity_range": (0.08, 0.45),
+              "random_walk_acceleration_range": (0.20, 1.20),
+              "sinusoid_frequency_range": (0.25, 1.20),
+            },
+            {
+              "step": 5000 * 48,
+              "mode_probabilities": (0.25, 0.35, 0.25, 0.15),
+              "amplitude_scale": 0.80,
+              "random_walk_velocity_range": (0.15, 0.80),
+              "random_walk_acceleration_range": (0.40, 2.00),
+              "sinusoid_frequency_range": (0.50, 2.00),
+              "pulse_duration_range": (0.35, 1.00),
+            },
+          ],
+        },
+      ),
+      "drift_weight": CurriculumTermCfg(
+        func=mdp.reward_weight,
+        params={
+          "reward_name": "root_xy_drift_huber",
+          "weight_stages": [
+            {"step": 0, "weight": -1.5},
+            {"step": 4000 * 48, "weight": -1.0},
+          ],
+        },
+      ),
+    }
 
   # Spawn exactly at each environment origin so the stationary target is explicit.
   cfg.events["reset_base"].params["pose_range"]["x"] = (0.0, 0.0)
   cfg.events["reset_base"].params["pose_range"]["y"] = (0.0, 0.0)
+  cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
+  if not play:
+    cfg.events["reset_base"].params["velocity_range"] = {
+      "x": (-0.10, 0.10),
+      "y": (-0.10, 0.10),
+      "roll": (-0.10, 0.10),
+      "pitch": (-0.10, 0.10),
+      "yaw": (-0.15, 0.15),
+    }
 
   # --- Replace locomotion rewards with stationary balance rewards ---
   for reward_name in (
@@ -154,27 +272,45 @@ def unitree_g1_lower_body_rough_env_cfg(
   ):
     cfg.rewards.pop(reward_name, None)
 
-  cfg.rewards["root_xy_displacement_l2"] = RewardTermCfg(
-    func=mdp.root_xy_displacement_l2,
-    weight=-10.0,
-    params={"asset_cfg": SceneEntityCfg("robot")},
+  cfg.rewards["root_xy_drift_huber"] = RewardTermCfg(
+    func=mdp.root_xy_drift_huber,
+    weight=-1.5,
+    params={
+      "deadband": 0.25,
+      "linear_width": 0.25,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
   )
-  cfg.rewards["root_planar_velocity_l2"] = RewardTermCfg(
-    func=mdp.root_planar_velocity_l2,
-    weight=-1.0,
-    params={"asset_cfg": SceneEntityCfg("robot")},
+  cfg.rewards["root_planar_velocity_saturating"] = RewardTermCfg(
+    func=mdp.root_planar_velocity_saturating,
+    weight=-0.6,
+    params={"saturation_speed": 0.75, "asset_cfg": SceneEntityCfg("robot")},
   )
-  cfg.rewards["com_support_box_violation"] = RewardTermCfg(
-    func=mdp.com_support_box_violation,
-    weight=-20.0,
+  cfg.rewards["com_support_margin_violation"] = RewardTermCfg(
+    func=mdp.com_support_margin_violation,
+    weight=-12.0,
     params={
       "sensor_name": "feet_ground_contact",
       "asset_cfg": SceneEntityCfg(
-        "robot", site_names=("left_foot", "right_foot")
+        "robot", site_names=FOOT_SITE_NAMES, body_names=FOOT_BODY_NAMES
       ),
       "foot_half_length": 0.10,
       "foot_half_width": 0.04,
       "margin": 0.02,
+    },
+  )
+  cfg.rewards["capture_point_support_margin_violation"] = RewardTermCfg(
+    func=mdp.capture_point_support_margin_violation,
+    weight=-8.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": SceneEntityCfg(
+        "robot", site_names=FOOT_SITE_NAMES, body_names=FOOT_BODY_NAMES
+      ),
+      "foot_half_length": 0.10,
+      "foot_half_width": 0.04,
+      "margin": 0.03,
+      "max_capture_offset": 0.80,
     },
   )
   cfg.rewards["track_planar_velocity_estimate"] = RewardTermCfg(
@@ -186,29 +322,62 @@ def unitree_g1_lower_body_rough_env_cfg(
       "asset_cfg": SceneEntityCfg("robot"),
     },
   )
+  cfg.rewards["pelvis_tilt_barrier"] = RewardTermCfg(
+    func=mdp.pelvis_tilt_barrier,
+    weight=-4.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+      "soft_limit": 0.20,
+      "hard_limit": 0.95,
+    },
+  )
   cfg.rewards["action_rate_l2"] = RewardTermCfg(
     func=mdp.action_term_rate_l2,
     weight=cfg.rewards["action_rate_l2"].weight,
     params={"action_name": "joint_pos"},
   )
+  cfg.rewards["action_acc_l2"] = RewardTermCfg(
+    func=mdp.action_term_acc_l2,
+    weight=-0.02,
+    params={"action_name": "joint_pos"},
+  )
+  cfg.rewards["pelvis_ang_acc_l2"] = RewardTermCfg(
+    func=mdp.body_angular_acceleration_penalty,
+    weight=-2.0e-4,
+    params={"asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",))},
+  )
 
-  # --- Pose reward: loosen lower body to allow CoG adaptation ---
-  # The upper body is randomly perturbed, so the policy needs freedom to
-  # bend knees, shift hips, and adjust ankles to compensate.
+  # --- Pose reward: strict at low risk, loose during active recovery ---
   cfg.rewards["pose"] = RewardTermCfg(
-    func=mdp.default_joint_position,
-    weight=0.5,
+    func=mdp.risk_gated_default_joint_position,
+    weight=0.7,
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-      "std": {
-        # Lower body -- loosened to allow adaptive balance.
-        r".*_hip_pitch_joint": 0.6,
-        r".*_hip_roll_joint": 0.35,
-        r".*_hip_yaw_joint": 0.25,
-        r".*_knee_joint": 0.7,
-        r".*_ankle_pitch_joint": 0.5,
-        r".*_ankle_roll_joint": 0.25,
-        # All upper body -- effectively disabled.
+      "low_risk_std": {
+        r".*_hip_pitch_joint": 0.35,
+        r".*_hip_roll_joint": 0.20,
+        r".*_hip_yaw_joint": 0.18,
+        r".*_knee_joint": 0.40,
+        r".*_ankle_pitch_joint": 0.25,
+        r".*_ankle_roll_joint": 0.16,
+        r"waist_yaw_joint": _DISABLED_STD,
+        r"waist_roll_joint": _DISABLED_STD,
+        r"waist_pitch_joint": _DISABLED_STD,
+        r".*_shoulder_pitch_joint": _DISABLED_STD,
+        r".*_shoulder_roll_joint": _DISABLED_STD,
+        r".*_shoulder_yaw_joint": _DISABLED_STD,
+        r".*_elbow_joint": _DISABLED_STD,
+        r".*_wrist_roll_joint": _DISABLED_STD,
+        r".*_wrist_pitch_joint": _DISABLED_STD,
+        r".*_wrist_yaw_joint": _DISABLED_STD,
+      },
+      "high_risk_std": {
+        r".*_hip_pitch_joint": 0.90,
+        r".*_hip_roll_joint": 0.55,
+        r".*_hip_yaw_joint": 0.35,
+        r".*_knee_joint": 1.10,
+        r".*_ankle_pitch_joint": 0.70,
+        r".*_ankle_roll_joint": 0.30,
         r"waist_yaw_joint": _DISABLED_STD,
         r"waist_roll_joint": _DISABLED_STD,
         r"waist_pitch_joint": _DISABLED_STD,
@@ -223,6 +392,18 @@ def unitree_g1_lower_body_rough_env_cfg(
     },
   )
 
+  cfg.rewards["stance_geometry"] = RewardTermCfg(
+    func=mdp.stance_geometry_penalty,
+    weight=-2.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+      "nominal_width": 0.22,
+      "risk_width": 0.34,
+      "max_width": 0.65,
+      "max_split": 0.65,
+    },
+  )
+
   # --- Restrict stand_still to lower body only ---
   cfg.rewards["stand_still"] = RewardTermCfg(
     func=mdp.stand_still,
@@ -230,6 +411,11 @@ def unitree_g1_lower_body_rough_env_cfg(
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
     },
+  )
+  cfg.rewards["no_foot_contact"] = RewardTermCfg(
+    func=mdp.no_foot_contact_penalty,
+    weight=-5.0,
+    params={"sensor_name": "feet_ground_contact"},
   )
 
   # --- Restrict joint_acc_l2 to lower body ---
@@ -272,18 +458,25 @@ def unitree_g1_lower_body_rough_env_cfg(
   # is perfectly balanced. Pelvis is below the waist and reflects actual
   # base stability.
   cfg.rewards["body_orientation_l2"].params["asset_cfg"].body_names = ("pelvis",)
+  cfg.rewards["body_orientation_l2"].weight = -2.0
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("pelvis",)
+  cfg.rewards["body_ang_vel"].weight = -0.15
+
+  cfg.terminations["illegal_contact"] = TerminationTermCfg(
+    func=mdp.illegal_contact,
+    params={"sensor_name": nonfoot_ground_cfg.name, "force_threshold": 10.0},
+  )
 
   # --- Stronger push disturbances (removed in play mode by base config) ---
   if "push_robot" in cfg.events:
-    cfg.events["push_robot"].interval_range_s = (1.0, 2.0)
+    cfg.events["push_robot"].interval_range_s = (2.0, 4.0)
     cfg.events["push_robot"].params["velocity_range"] = {
-      "x": (-0.8, 0.8),
-      "y": (-0.8, 0.8),
-      "z": (-0.5, 0.5),
-      "roll": (-0.8, 0.8),
-      "pitch": (-0.8, 0.8),
-      "yaw": (-1.0, 1.0),
+      "x": (-0.6, 0.6),
+      "y": (-0.6, 0.6),
+      "z": (-0.3, 0.3),
+      "roll": (-0.5, 0.5),
+      "pitch": (-0.5, 0.5),
+      "yaw": (-0.7, 0.7),
     }
 
   # --- Reduce angular momentum penalty ---
@@ -316,7 +509,6 @@ def unitree_g1_lower_body_flat_env_cfg(
   for group in ("actor", "critic"):
     cfg.observations[group].terms.pop("height_scan", None)
 
-  # No terrain or velocity-command curriculum for the stationary task.
-  cfg.curriculum = {}
+  # Keep upper-body disturbance/reward curriculum on flat terrain.
 
   return cfg

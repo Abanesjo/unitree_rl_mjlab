@@ -27,6 +27,17 @@ class RewardWeightStage(TypedDict):
   weight: float
 
 
+class UpperBodyDisturbanceStage(TypedDict, total=False):
+  step: int
+  mode_probabilities: tuple[float, float, float, float]
+  amplitude_scale: float
+  resampling_time_range: tuple[float, float]
+  random_walk_velocity_range: tuple[float, float]
+  random_walk_acceleration_range: tuple[float, float]
+  sinusoid_frequency_range: tuple[float, float]
+  pulse_duration_range: tuple[float, float]
+
+
 def terrain_levels_vel(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,
@@ -105,3 +116,25 @@ def reward_weight(
     if env.common_step_counter > stage["step"]:
       reward_term_cfg.weight = stage["weight"]
   return torch.tensor([reward_term_cfg.weight])
+
+
+def upper_body_disturbance(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  command_name: str,
+  stages: list[UpperBodyDisturbanceStage],
+) -> dict[str, torch.Tensor]:
+  """Stage upper-body disturbance modes and amplitudes during training."""
+  del env_ids
+  command_term = env.command_manager.get_term(command_name)
+  cfg = command_term.cfg
+  for stage in stages:
+    if env.common_step_counter > stage["step"]:
+      for key, value in stage.items():
+        if key == "step":
+          continue
+        setattr(cfg, key, value)
+
+  return {
+    "amplitude_scale": torch.tensor(float(getattr(cfg, "amplitude_scale", 0.0))),
+  }

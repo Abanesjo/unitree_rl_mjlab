@@ -2,6 +2,7 @@
 #include "unitree_articulation.h"
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
+#include <algorithm>
 #include <unordered_map>
 
 namespace isaaclab
@@ -54,7 +55,11 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 void State_RLBase::run()
 {
     auto action = env->action_manager->processed_actions();
-    for(int i(0); i < env->robot->data.joint_ids_map.size(); i++) {
+    const int num_actuated = std::min(
+        static_cast<int>(env->robot->data.joint_ids_map.size()),
+        static_cast<int>(action.size())
+    );
+    for(int i(0); i < num_actuated; i++) {
         lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];
     }
 }
