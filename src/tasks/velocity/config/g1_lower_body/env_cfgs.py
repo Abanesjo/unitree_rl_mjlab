@@ -5,8 +5,11 @@ velocity estimates. Upper-body joints are driven by a separate PD action from
 smooth disturbance commands and are never controlled by the policy.
 """
 
+import math
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -147,7 +150,7 @@ def unitree_g1_lower_body_rough_env_cfg(
       actuator_names=(".*_hip_.*", ".*_knee_.*", ".*_ankle_.*"),
       scale=G1_LOWER_BODY_ACTION_SCALE,
       use_default_offset=True,
-      smoothing_alpha_range=(0.55, 0.55),
+      smoothing_alpha_range=(0.65, 0.80),
       delay_steps_range=(0, 0),
     ),
     "planar_velocity_estimate": PlanarVelocityEstimateActionCfg(
@@ -177,6 +180,34 @@ def unitree_g1_lower_body_rough_env_cfg(
     debug_vis=False,
   )
 
+  if not play:
+    cfg.events["push_robot"] = EventTermCfg(
+      func=mdp.apply_planar_body_force_pulse,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+        "force_magnitude_range": (0.0, 0.0),
+        "force_z_range": (0.0, 0.0),
+        "torque_range": (0.0, 0.0),
+        "duration_s": (0.06, 0.09),
+        "cooldown_s": (8.0, 12.0),
+        "body_point_offset": (0.0, 0.0, -0.10),
+      },
+    )
+    cfg.events["recovery_drill_reset"] = EventTermCfg(
+      func=mdp.reset_recovery_drill_state,
+      mode="reset",
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "probability": 0.0,
+        "planar_speed_range": (0.0, 0.0),
+        "tilt_range": (0.0, 0.0),
+        "angular_speed_range": (0.0, 0.0),
+        "yaw_rate_range": (0.0, 0.0),
+        "height_offset_range": (0.0, 0.0),
+      },
+    )
+
   # --- Remove locomotion observations and expose upper-body command only ---
   for group in ("actor", "critic"):
     terms = cfg.observations[group].terms
@@ -196,6 +227,10 @@ def unitree_g1_lower_body_rough_env_cfg(
       params={"asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES)},
     )
 
+  cfg.observations["actor"].terms["foot_contact"] = ObservationTermCfg(
+    func=mdp.foot_contact,
+    params={"sensor_name": "feet_ground_contact"},
+  )
   cfg.observations["actor"].history_length = 6
   cfg.observations["critic"].history_length = 1
   cfg.observations["critic"].terms["whole_body_com_b"] = ObservationTermCfg(
@@ -286,6 +321,56 @@ def unitree_g1_lower_body_rough_env_cfg(
               "sinusoid_frequency_range": (0.50, 2.00),
               "pulse_duration_range": (0.35, 1.00),
             },
+            {
+              "step": 14600 * 48,
+              "mode_probabilities": (0.75, 0.20, 0.05, 0.0),
+              "amplitude_scale": 0.25,
+              "rel_default_envs": 0.15,
+              "random_walk_velocity_range": (0.05, 0.25),
+              "random_walk_acceleration_range": (0.12, 0.70),
+              "sinusoid_frequency_range": (0.25, 0.90),
+              "pulse_duration_range": (0.45, 1.20),
+            },
+            {
+              "step": 15400 * 48,
+              "mode_probabilities": (0.55, 0.30, 0.12, 0.03),
+              "amplitude_scale": 0.40,
+              "rel_default_envs": 0.10,
+              "random_walk_velocity_range": (0.08, 0.35),
+              "random_walk_acceleration_range": (0.18, 1.00),
+              "sinusoid_frequency_range": (0.30, 1.15),
+              "pulse_duration_range": (0.40, 1.10),
+            },
+            {
+              "step": 16500 * 48,
+              "mode_probabilities": (0.50, 0.32, 0.14, 0.04),
+              "amplitude_scale": 0.45,
+              "rel_default_envs": 0.08,
+              "random_walk_velocity_range": (0.08, 0.40),
+              "random_walk_acceleration_range": (0.20, 1.10),
+              "sinusoid_frequency_range": (0.30, 1.20),
+              "pulse_duration_range": (0.40, 1.10),
+            },
+            {
+              "step": 18000 * 48,
+              "mode_probabilities": (0.40, 0.35, 0.18, 0.07),
+              "amplitude_scale": 0.55,
+              "rel_default_envs": 0.07,
+              "random_walk_velocity_range": (0.10, 0.50),
+              "random_walk_acceleration_range": (0.25, 1.35),
+              "sinusoid_frequency_range": (0.35, 1.45),
+              "pulse_duration_range": (0.38, 1.05),
+            },
+            {
+              "step": 20500 * 48,
+              "mode_probabilities": (0.30, 0.35, 0.23, 0.12),
+              "amplitude_scale": 0.70,
+              "rel_default_envs": 0.05,
+              "random_walk_velocity_range": (0.13, 0.70),
+              "random_walk_acceleration_range": (0.35, 1.80),
+              "sinusoid_frequency_range": (0.45, 1.85),
+              "pulse_duration_range": (0.35, 1.00),
+            },
           ],
         },
       ),
@@ -296,6 +381,72 @@ def unitree_g1_lower_body_rough_env_cfg(
           "weight_stages": [
             {"step": 0, "weight": -1.5},
             {"step": 4000 * 48, "weight": -1.0},
+            {"step": 14500 * 48, "weight": -0.65},
+            {"step": 18000 * 48, "weight": -0.9},
+          ],
+        },
+      ),
+      "recovery_drill": CurriculumTermCfg(
+        func=mdp.recovery_drill_curriculum,
+        params={
+          "event_name": "recovery_drill_reset",
+          "stages": [
+            {
+              "step": 0,
+              "probability": 0.0,
+              "planar_speed_range": (0.0, 0.0),
+              "tilt_range": (0.0, 0.0),
+              "angular_speed_range": (0.0, 0.0),
+              "yaw_rate_range": (0.0, 0.0),
+            },
+            {
+              "step": 14500 * 48,
+              "probability": 0.20,
+              "planar_speed_range": (0.08, 0.20),
+              "tilt_range": (math.radians(2.0), math.radians(5.0)),
+              "angular_speed_range": (0.15, 0.35),
+              "yaw_rate_range": (-0.08, 0.08),
+            },
+            {
+              "step": 14800 * 48,
+              "probability": 0.40,
+              "planar_speed_range": (0.16, 0.38),
+              "tilt_range": (math.radians(4.0), math.radians(10.0)),
+              "angular_speed_range": (0.25, 0.75),
+              "yaw_rate_range": (-0.12, 0.12),
+            },
+            {
+              "step": 15200 * 48,
+              "probability": 0.50,
+              "planar_speed_range": (0.20, 0.48),
+              "tilt_range": (math.radians(5.0), math.radians(12.0)),
+              "angular_speed_range": (0.35, 0.95),
+              "yaw_rate_range": (-0.16, 0.16),
+            },
+            {
+              "step": 16500 * 48,
+              "probability": 0.54,
+              "planar_speed_range": (0.24, 0.58),
+              "tilt_range": (math.radians(6.0), math.radians(14.0)),
+              "angular_speed_range": (0.45, 1.10),
+              "yaw_rate_range": (-0.22, 0.22),
+            },
+            {
+              "step": 18500 * 48,
+              "probability": 0.62,
+              "planar_speed_range": (0.30, 0.75),
+              "tilt_range": (math.radians(7.0), math.radians(18.0)),
+              "angular_speed_range": (0.55, 1.50),
+              "yaw_rate_range": (-0.32, 0.32),
+            },
+            {
+              "step": 21500 * 48,
+              "probability": 0.75,
+              "planar_speed_range": (0.40, 1.00),
+              "tilt_range": (math.radians(9.0), math.radians(23.0)),
+              "angular_speed_range": (0.70, 1.90),
+              "yaw_rate_range": (-0.45, 0.45),
+            },
           ],
         },
       ),
@@ -306,111 +457,139 @@ def unitree_g1_lower_body_rough_env_cfg(
           "stages": [
             {
               "step": 0,
-              "interval_range_s": (6.0, 10.0),
-              "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-              },
+              "force_magnitude_range": (0.0, 0.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.09),
+              "cooldown_s": (8.0, 12.0),
             },
             {
               "step": 9000 * 48,
-              "interval_range_s": (8.0, 12.0),
-              "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-              },
+              "force_magnitude_range": (0.0, 0.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.09),
+              "cooldown_s": (8.0, 12.0),
             },
             {
               "step": 12000 * 48,
-              "interval_range_s": (8.0, 12.0),
-              "velocity_range": {
-                "x": (-0.06, 0.06),
-                "y": (-0.06, 0.06),
-                "z": (-0.02, 0.02),
-                "roll": (-0.04, 0.04),
-                "pitch": (-0.04, 0.04),
-                "yaw": (-0.08, 0.08),
-              },
+              "force_magnitude_range": (40.0, 70.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.05, 0.08),
+              "cooldown_s": (8.0, 12.0),
             },
             {
               "step": 13500 * 48,
-              "interval_range_s": (6.0, 10.0),
-              "velocity_range": {
-                "x": (-0.15, 0.15),
-                "y": (-0.15, 0.15),
-                "z": (-0.05, 0.05),
-                "roll": (-0.12, 0.12),
-                "pitch": (-0.12, 0.12),
-                "yaw": (-0.20, 0.20),
-              },
+              "force_magnitude_range": (50.0, 80.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.09),
+              "cooldown_s": (6.0, 10.0),
             },
             {
               "step": 13700 * 48,
-              "interval_range_s": (5.0, 8.0),
-              "velocity_range": {
-                "x": (-0.22, 0.22),
-                "y": (-0.22, 0.22),
-                "z": (-0.08, 0.08),
-                "roll": (-0.18, 0.18),
-                "pitch": (-0.18, 0.18),
-                "yaw": (-0.28, 0.28),
-              },
+              "force_magnitude_range": (60.0, 95.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (5.0, 8.0),
             },
             {
               "step": 14200 * 48,
-              "interval_range_s": (5.0, 8.0),
-              "velocity_range": {
-                "x": (-0.25, 0.25),
-                "y": (-0.25, 0.25),
-                "z": (-0.10, 0.10),
-                "roll": (-0.21, 0.21),
-                "pitch": (-0.21, 0.21),
-                "yaw": (-0.32, 0.32),
-              },
+              "force_magnitude_range": (70.0, 110.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (5.0, 8.0),
+            },
+            {
+              "step": 14600 * 48,
+              "force_magnitude_range": (0.0, 0.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (6.0, 9.0),
             },
             {
               "step": 14800 * 48,
-              "interval_range_s": (4.0, 7.0),
-              "velocity_range": {
-                "x": (-0.30, 0.30),
-                "y": (-0.30, 0.30),
-                "z": (-0.12, 0.12),
-                "roll": (-0.25, 0.25),
-                "pitch": (-0.25, 0.25),
-                "yaw": (-0.35, 0.35),
-              },
+              "force_magnitude_range": (0.0, 0.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (6.0, 9.0),
             },
             {
-              "step": 16000 * 48,
-              "interval_range_s": (3.0, 6.0),
-              "velocity_range": {
-                "x": (-0.40, 0.40),
-                "y": (-0.40, 0.40),
-                "z": (-0.20, 0.20),
-                "roll": (-0.35, 0.35),
-                "pitch": (-0.35, 0.35),
-                "yaw": (-0.50, 0.50),
-              },
+              "step": 15400 * 48,
+              "force_magnitude_range": (40.0, 70.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (6.0, 9.0),
+            },
+            {
+              "step": 15800 * 48,
+              "force_magnitude_range": (60.0, 100.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (5.0, 7.0),
+            },
+            {
+              "step": 16200 * 48,
+              "force_magnitude_range": (70.0, 115.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.06, 0.10),
+              "cooldown_s": (5.0, 7.0),
+            },
+            {
+              "step": 16500 * 48,
+              "force_magnitude_range": (85.0, 130.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.07, 0.11),
+              "cooldown_s": (4.5, 6.5),
+            },
+            {
+              "step": 17500 * 48,
+              "force_magnitude_range": (100.0, 150.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.07, 0.11),
+              "cooldown_s": (4.0, 6.0),
             },
             {
               "step": 18500 * 48,
-              "interval_range_s": (2.0, 4.0),
-              "velocity_range": {
-                "x": (-0.50, 0.50),
-                "y": (-0.50, 0.50),
-                "z": (-0.40, 0.40),
-                "roll": (-0.52, 0.52),
-                "pitch": (-0.52, 0.52),
-                "yaw": (-0.78, 0.78),
-              },
+              "force_magnitude_range": (120.0, 180.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.08, 0.12),
+              "cooldown_s": (3.5, 5.5),
+            },
+            {
+              "step": 20500 * 48,
+              "force_magnitude_range": (180.0, 260.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.08, 0.12),
+              "cooldown_s": (3.0, 5.0),
+            },
+            {
+              "step": 22500 * 48,
+              "force_magnitude_range": (240.0, 360.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.09, 0.14),
+              "cooldown_s": (2.0, 4.0),
+            },
+            {
+              "step": 25000 * 48,
+              "force_magnitude_range": (320.0, 480.0),
+              "force_z_range": (0.0, 0.0),
+              "torque_range": (0.0, 0.0),
+              "duration_s": (0.09, 0.14),
+              "cooldown_s": (2.0, 4.0),
             },
           ],
         },
@@ -450,9 +629,14 @@ def unitree_g1_lower_body_rough_env_cfg(
     },
   )
   cfg.rewards["root_planar_velocity_saturating"] = RewardTermCfg(
-    func=mdp.root_planar_velocity_saturating,
+    func=mdp.root_planar_velocity_saturating_risk_gated,
     weight=-0.6,
-    params={"saturation_speed": 0.75, "asset_cfg": SceneEntityCfg("robot")},
+    params={
+      "saturation_speed": 0.75,
+      "risk_reduction": 0.85,
+      "min_scale": 0.12,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
   )
   cfg.rewards["com_support_margin_violation"] = RewardTermCfg(
     func=mdp.com_support_margin_violation,
@@ -481,6 +665,23 @@ def unitree_g1_lower_body_rough_env_cfg(
       "max_capture_offset": 0.80,
     },
   )
+  cfg.rewards["capture_margin_improvement"] = RewardTermCfg(
+    func=mdp.capture_margin_improvement_reward,
+    weight=4.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": SceneEntityCfg(
+        "robot", site_names=FOOT_SITE_NAMES, body_names=FOOT_BODY_NAMES
+      ),
+      "foot_half_length": 0.10,
+      "foot_half_width": 0.04,
+      "margin": 0.03,
+      "max_capture_offset": 0.80,
+      "delta_scale": 0.035,
+      "max_reward": 0.8,
+      "max_penalty": 1.0,
+    },
+  )
   cfg.rewards["track_planar_velocity_estimate"] = RewardTermCfg(
     func=mdp.track_planar_velocity_estimate,
     weight=0.5,
@@ -500,25 +701,35 @@ def unitree_g1_lower_body_rough_env_cfg(
     },
   )
   cfg.rewards["action_rate_l2"] = RewardTermCfg(
-    func=mdp.action_term_rate_l2,
-    weight=cfg.rewards["action_rate_l2"].weight,
-    params={"action_name": "joint_pos"},
+    func=mdp.action_term_rate_l2_risk_gated,
+    weight=-0.045,
+    params={
+      "action_name": "joint_pos",
+      "risk_reduction": 0.80,
+      "min_scale": 0.20,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
-    func=mdp.action_term_acc_l2,
-    weight=-0.02,
-    params={"action_name": "joint_pos"},
+    func=mdp.action_term_acc_l2_risk_gated,
+    weight=-0.015,
+    params={
+      "action_name": "joint_pos",
+      "risk_reduction": 0.85,
+      "min_scale": 0.15,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
   )
   cfg.rewards["pelvis_ang_acc_l2"] = RewardTermCfg(
     func=mdp.body_angular_acceleration_penalty,
-    weight=-2.0e-4,
+    weight=-3.0e-4,
     params={"asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",))},
   )
 
   # --- Pose reward: strict at low risk, loose during active recovery ---
   cfg.rewards["pose"] = RewardTermCfg(
     func=mdp.risk_gated_default_joint_position,
-    weight=0.7,
+    weight=0.45,
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
       "low_risk_std": {
@@ -562,21 +773,104 @@ def unitree_g1_lower_body_rough_env_cfg(
 
   cfg.rewards["stance_geometry"] = RewardTermCfg(
     func=mdp.stance_geometry_penalty,
-    weight=-8.0,
+    weight=-24.0,
     params={
       "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
       "nominal_width": 0.22,
-      "risk_width": 0.48,
-      "max_width": 0.72,
-      "risk_split_gain": 1.15,
-      "max_split": 0.75,
+      "risk_width": 0.52,
+      "max_width": 0.78,
+      "risk_split_gain": 1.40,
+      "split_velocity_gain": 1.30,
+      "risk_min_split": 0.24,
+      "width_lateral_velocity_gain": 0.45,
+      "max_split": 0.80,
+    },
+  )
+  cfg.rewards["capture_point_reach"] = RewardTermCfg(
+    func=mdp.capture_point_reach_penalty,
+    weight=-35.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+      "min_fore_aft_reach": 0.30,
+      "max_fore_aft_reach": 0.68,
+      "capture_fore_aft_gain": 1.60,
+      "velocity_fore_aft_gain": 1.40,
+      "min_lateral_reach": 0.24,
+      "max_lateral_reach": 0.48,
+      "capture_lateral_gain": 1.00,
+      "velocity_lateral_gain": 0.70,
+      "direction_velocity_gain": 0.35,
+      "direction_deadband": 0.025,
+      "lateral_weight": 0.55,
+    },
+  )
+  cfg.rewards["recovery_step_clearance"] = RewardTermCfg(
+    func=mdp.recovery_step_clearance_penalty,
+    weight=-20.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+      "min_fore_aft_reach": 0.18,
+      "max_fore_aft_reach": 0.58,
+      "com_fore_aft_gain": 0.75,
+      "velocity_fore_aft_gain": 0.85,
+      "min_lateral_reach": 0.16,
+      "max_lateral_reach": 0.42,
+      "com_lateral_gain": 0.50,
+      "velocity_lateral_gain": 0.45,
+      "direction_com_gain": 0.45,
+      "direction_velocity_gain": 0.45,
+      "clearance_height": 0.055,
+      "lateral_weight": 0.45,
+    },
+  )
+  cfg.rewards["recovery_step_contact_phase"] = RewardTermCfg(
+    func=mdp.recovery_step_contact_phase_penalty,
+    weight=-35.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+      "min_reach": 0.26,
+      "max_reach": 0.64,
+      "com_reach_gain": 0.75,
+      "velocity_reach_gain": 0.60,
+      "capture_reach_gain": 0.85,
+      "direction_com_gain": 0.60,
+      "direction_velocity_gain": 0.70,
+      "direction_deadband": 0.04,
+      "risk_activation": 0.12,
+      "clearance_height": 0.055,
+      "min_step_velocity": 0.14,
+      "recontact_margin": 0.03,
+      "support_contact_weight": 1.5,
+      "stuck_contact_weight": 1.2,
+      "clearance_weight": 1.0,
+      "velocity_weight": 0.8,
+      "recontact_weight": 0.6,
+      "no_support_weight": 2.0,
+    },
+  )
+  cfg.rewards["recovery_swing_bonus"] = RewardTermCfg(
+    func=mdp.recovery_swing_bonus,
+    weight=18.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+      "min_reach": 0.24,
+      "max_reach": 0.64,
+      "capture_reach_gain": 0.90,
+      "velocity_reach_gain": 0.70,
+      "direction_com_gain": 0.60,
+      "direction_velocity_gain": 0.75,
+      "risk_activation": 0.12,
+      "target_clearance": 0.06,
+      "target_velocity": 0.22,
     },
   )
 
   # --- Restrict stand_still to lower body only ---
   cfg.rewards["stand_still"] = RewardTermCfg(
     func=mdp.stand_still,
-    weight=-0.1,
+    weight=-0.03,
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_PATTERNS)
     },
@@ -637,20 +931,14 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.rewards["body_ang_vel"].weight = -0.15
 
   cfg.terminations.pop("illegal_contact", None)
+  cfg.terminations["fell_over"].params["limit_angle"] = math.radians(80.0)
 
-  # Preserve sim-to-real randomization from the base G1 task. Pushes are kept
-  # as an event term and staged by curriculum above so early learning remains
-  # focused on upper-body disturbance balance.
+  # Preserve sim-to-real randomization from the base G1 task. External pushes
+  # are finite planar force pulses staged by curriculum above.
   if "push_robot" in cfg.events:
-    cfg.events["push_robot"].interval_range_s = (6.0, 10.0)
-    cfg.events["push_robot"].params["velocity_range"] = {
-      "x": (0.0, 0.0),
-      "y": (0.0, 0.0),
-      "z": (0.0, 0.0),
-      "roll": (0.0, 0.0),
-      "pitch": (0.0, 0.0),
-      "yaw": (0.0, 0.0),
-    }
+    cfg.events["push_robot"].params["force_magnitude_range"] = (0.0, 0.0)
+    cfg.events["push_robot"].params["force_z_range"] = (0.0, 0.0)
+    cfg.events["push_robot"].params["torque_range"] = (0.0, 0.0)
   if "base_com" in cfg.events:
     cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 

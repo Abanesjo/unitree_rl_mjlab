@@ -43,6 +43,21 @@ class PushRobotStage(TypedDict, total=False):
   step: int
   interval_range_s: tuple[float, float]
   velocity_range: dict[str, tuple[float, float]]
+  force_magnitude_range: tuple[float, float]
+  force_z_range: tuple[float, float]
+  torque_range: tuple[float, float]
+  duration_s: tuple[float, float]
+  cooldown_s: tuple[float, float]
+
+
+class RecoveryDrillStage(TypedDict, total=False):
+  step: int
+  probability: float
+  planar_speed_range: tuple[float, float]
+  tilt_range: tuple[float, float]
+  angular_speed_range: tuple[float, float]
+  yaw_rate_range: tuple[float, float]
+  height_offset_range: tuple[float, float]
 
 
 def terrain_levels_vel(
@@ -160,13 +175,67 @@ def push_robot_curriculum(
     if env.common_step_counter > stage["step"]:
       if "interval_range_s" in stage:
         event_cfg.interval_range_s = stage["interval_range_s"]
-      if "velocity_range" in stage:
-        event_cfg.params["velocity_range"] = stage["velocity_range"]
+      for key in (
+        "velocity_range",
+        "force_magnitude_range",
+        "force_z_range",
+        "torque_range",
+        "duration_s",
+        "cooldown_s",
+      ):
+        if key in stage:
+          event_cfg.params[key] = stage[key]
 
   velocity_range = event_cfg.params.get("velocity_range", {})
   max_abs = 0.0
   for bounds in velocity_range.values():
     max_abs = max(max_abs, abs(float(bounds[0])), abs(float(bounds[1])))
+  force_range = event_cfg.params.get("force_magnitude_range", (0.0, 0.0))
+  duration_s = event_cfg.params.get("duration_s", (0.0, 0.0))
+  cooldown_s = event_cfg.params.get("cooldown_s", (0.0, 0.0))
   return {
     "max_velocity_range": torch.tensor(max_abs, device=env.device),
+    "max_force_n": torch.tensor(
+      max(abs(float(force_range[0])), abs(float(force_range[1]))),
+      device=env.device,
+    ),
+    "duration_s": torch.tensor(float(duration_s[1]), device=env.device),
+    "cooldown_s": torch.tensor(float(cooldown_s[0]), device=env.device),
+  }
+
+
+def recovery_drill_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_name: str,
+  stages: list[RecoveryDrillStage],
+) -> dict[str, torch.Tensor]:
+  """Stage reset-time recovery drills from easy nudges to larger lean states."""
+  del env_ids
+  event_cfg = env.event_manager.get_term_cfg(event_name)
+  for stage in stages:
+    if env.common_step_counter > stage["step"]:
+      for key in (
+        "probability",
+        "planar_speed_range",
+        "tilt_range",
+        "angular_speed_range",
+        "yaw_rate_range",
+        "height_offset_range",
+      ):
+        if key in stage:
+          event_cfg.params[key] = stage[key]
+
+  speed_range = event_cfg.params.get("planar_speed_range", (0.0, 0.0))
+  tilt_range = event_cfg.params.get("tilt_range", (0.0, 0.0))
+  angular_speed_range = event_cfg.params.get("angular_speed_range", (0.0, 0.0))
+  return {
+    "probability": torch.tensor(
+      float(event_cfg.params.get("probability", 0.0)), device=env.device
+    ),
+    "max_planar_speed": torch.tensor(float(speed_range[1]), device=env.device),
+    "max_tilt_rad": torch.tensor(float(tilt_range[1]), device=env.device),
+    "max_angular_speed": torch.tensor(
+      float(angular_speed_range[1]), device=env.device
+    ),
   }
