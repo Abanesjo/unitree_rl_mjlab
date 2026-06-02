@@ -109,13 +109,21 @@ class UpperBodyDisturbanceCommand(CommandTerm):
 
   def _sample_pose(self, env_ids: torch.Tensor) -> torch.Tensor:
     n = len(env_ids)
-    sample = self._range_low + torch.rand(
+    raw_sample = self._range_low + torch.rand(
       n, self._num_joints, device=self.device
     ) * (self._range_high - self._range_low)
+    default = self._default_joint_pos[env_ids]
+    amp_scale = torch.clamp(
+      torch.tensor(float(self.cfg.amplitude_scale), device=self.device),
+      min=0.0,
+      max=1.0,
+    )
+    sample = default + (raw_sample - default) * amp_scale
+    sample = torch.clamp(sample, self._range_low, self._range_high)
     if self.cfg.rel_default_envs > 0.0:
       default_mask = torch.rand(n, device=self.device) <= self.cfg.rel_default_envs
       if default_mask.any():
-        sample[default_mask] = self._default_joint_pos[env_ids[default_mask]]
+        sample[default_mask] = default[default_mask]
     return sample
 
   def _sample_modes(self, env_ids: torch.Tensor) -> torch.Tensor:

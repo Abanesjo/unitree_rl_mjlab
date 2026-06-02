@@ -6,7 +6,6 @@ smooth disturbance commands and are never controlled by the policy.
 """
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.managers import TerminationTermCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -15,6 +14,7 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 
 import src.tasks.velocity.mdp as mdp
 
+from src.assets.robots.unitree_g1.g1_constants import KNEES_BENT_KEYFRAME
 from src.tasks.velocity.config.g1.env_cfgs import (
   unitree_g1_rough_env_cfg,
 )
@@ -92,6 +92,19 @@ FOOT_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
 FOOT_GEOM_NAMES = tuple(
   f"{side}_foot{i}_collision" for side in ("left", "right") for i in range(1, 8)
 )
+BAD_GROUND_GEOM_NAMES = (
+  "pelvis_collision",
+  "torso_collision",
+  "head_collision",
+  "left_shoulder_yaw_collision",
+  "left_elbow_yaw_collision",
+  "left_wrist_collision",
+  "left_hand_collision",
+  "right_shoulder_yaw_collision",
+  "right_elbow_yaw_collision",
+  "right_wrist_collision",
+  "right_hand_collision",
+)
 
 # Lower body joint patterns (for reward filtering).
 LOWER_BODY_JOINT_PATTERNS = (
@@ -110,14 +123,14 @@ def unitree_g1_lower_body_rough_env_cfg(
   """Create Unitree G1 rough terrain lower-body stationary config."""
   cfg = unitree_g1_rough_env_cfg(play=play)
   cfg.sim.nconmax = None
+  cfg.scene.entities["robot"].init_state = KNEES_BENT_KEYFRAME
 
   nonfoot_ground_cfg = ContactSensorCfg(
     name="nonfoot_ground_touch",
     primary=ContactMatch(
       mode="geom",
       entity="robot",
-      pattern=r".*_collision\d*$",
-      exclude=FOOT_GEOM_NAMES,
+      pattern=BAD_GROUND_GEOM_NAMES,
     ),
     secondary=ContactMatch(mode="body", pattern="terrain"),
     fields=("found", "force"),
@@ -134,8 +147,8 @@ def unitree_g1_lower_body_rough_env_cfg(
       actuator_names=(".*_hip_.*", ".*_knee_.*", ".*_ankle_.*"),
       scale=G1_LOWER_BODY_ACTION_SCALE,
       use_default_offset=True,
-      smoothing_alpha_range=(0.55, 0.55) if play else (0.40, 0.70),
-      delay_steps_range=(0, 0) if play else (0, 3),
+      smoothing_alpha_range=(0.55, 0.55),
+      delay_steps_range=(0, 0),
     ),
     "planar_velocity_estimate": PlanarVelocityEstimateActionCfg(
       entity_name="robot",
@@ -152,11 +165,11 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.commands["upper_body"] = UpperBodyDisturbanceCommandCfg(
     entity_name="robot",
     joint_names=UPPER_BODY_JOINTS,
-    resampling_time_range=(3.0, 6.0),
-    rel_default_envs=0.10,
+    resampling_time_range=(4.0, 8.0),
+    rel_default_envs=1.00,
     ranges=UPPER_BODY_JOINT_RANGES,
     mode_probabilities=(1.0, 0.0, 0.0, 0.0),
-    amplitude_scale=0.20,
+    amplitude_scale=0.00,
     random_walk_velocity_range=(0.05, 0.20),
     random_walk_acceleration_range=(0.10, 0.60),
     sinusoid_frequency_range=(0.25, 0.80),
@@ -209,27 +222,65 @@ def unitree_g1_lower_body_rough_env_cfg(
             {
               "step": 0,
               "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
-              "amplitude_scale": 0.20,
+              "amplitude_scale": 0.00,
+              "rel_default_envs": 1.00,
+              "resampling_time_range": (4.0, 8.0),
+            },
+            {
+              "step": 120 * 48,
+              "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
+              "amplitude_scale": 0.08,
+              "rel_default_envs": 0.70,
+              "resampling_time_range": (3.5, 6.0),
+            },
+            {
+              "step": 300 * 48,
+              "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
+              "amplitude_scale": 0.18,
+              "rel_default_envs": 0.45,
               "resampling_time_range": (3.0, 6.0),
             },
             {
-              "step": 1000 * 48,
+              "step": 700 * 48,
               "mode_probabilities": (1.0, 0.0, 0.0, 0.0),
-              "amplitude_scale": 0.45,
+              "amplitude_scale": 0.32,
+              "rel_default_envs": 0.25,
               "resampling_time_range": (2.5, 5.0),
             },
             {
-              "step": 2500 * 48,
+              "step": 1300 * 48,
+              "mode_probabilities": (0.75, 0.20, 0.05, 0.0),
+              "amplitude_scale": 0.50,
+              "rel_default_envs": 0.15,
+              "resampling_time_range": (2.5, 5.0),
+              "random_walk_velocity_range": (0.05, 0.30),
+              "random_walk_acceleration_range": (0.12, 0.80),
+              "sinusoid_frequency_range": (0.25, 0.90),
+            },
+            {
+              "step": 2400 * 48,
               "mode_probabilities": (0.45, 0.35, 0.15, 0.05),
               "amplitude_scale": 0.60,
+              "rel_default_envs": 0.10,
               "random_walk_velocity_range": (0.08, 0.45),
               "random_walk_acceleration_range": (0.20, 1.20),
               "sinusoid_frequency_range": (0.25, 1.20),
             },
             {
-              "step": 5000 * 48,
+              "step": 5200 * 48,
+              "mode_probabilities": (0.35, 0.35, 0.20, 0.10),
+              "amplitude_scale": 0.70,
+              "rel_default_envs": 0.08,
+              "random_walk_velocity_range": (0.12, 0.65),
+              "random_walk_acceleration_range": (0.30, 1.60),
+              "sinusoid_frequency_range": (0.40, 1.60),
+              "pulse_duration_range": (0.40, 1.20),
+            },
+            {
+              "step": 8000 * 48,
               "mode_probabilities": (0.25, 0.35, 0.25, 0.15),
               "amplitude_scale": 0.80,
+              "rel_default_envs": 0.05,
               "random_walk_velocity_range": (0.15, 0.80),
               "random_walk_acceleration_range": (0.40, 2.00),
               "sinusoid_frequency_range": (0.50, 2.00),
@@ -248,6 +299,86 @@ def unitree_g1_lower_body_rough_env_cfg(
           ],
         },
       ),
+      "push_robot": CurriculumTermCfg(
+        func=mdp.push_robot_curriculum,
+        params={
+          "event_name": "push_robot",
+          "stages": [
+            {
+              "step": 0,
+              "interval_range_s": (6.0, 10.0),
+              "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+              },
+            },
+            {
+              "step": 9000 * 48,
+              "interval_range_s": (8.0, 12.0),
+              "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+              },
+            },
+            {
+              "step": 14000 * 48,
+              "interval_range_s": (8.0, 12.0),
+              "velocity_range": {
+                "x": (-0.06, 0.06),
+                "y": (-0.06, 0.06),
+                "z": (-0.02, 0.02),
+                "roll": (-0.04, 0.04),
+                "pitch": (-0.04, 0.04),
+                "yaw": (-0.08, 0.08),
+              },
+            },
+            {
+              "step": 18000 * 48,
+              "interval_range_s": (6.0, 10.0),
+              "velocity_range": {
+                "x": (-0.15, 0.15),
+                "y": (-0.15, 0.15),
+                "z": (-0.05, 0.05),
+                "roll": (-0.12, 0.12),
+                "pitch": (-0.12, 0.12),
+                "yaw": (-0.20, 0.20),
+              },
+            },
+            {
+              "step": 21000 * 48,
+              "interval_range_s": (4.0, 7.0),
+              "velocity_range": {
+                "x": (-0.30, 0.30),
+                "y": (-0.30, 0.30),
+                "z": (-0.12, 0.12),
+                "roll": (-0.25, 0.25),
+                "pitch": (-0.25, 0.25),
+                "yaw": (-0.35, 0.35),
+              },
+            },
+            {
+              "step": 24000 * 48,
+              "interval_range_s": (1.0, 3.0),
+              "velocity_range": {
+                "x": (-0.50, 0.50),
+                "y": (-0.50, 0.50),
+                "z": (-0.40, 0.40),
+                "roll": (-0.52, 0.52),
+                "pitch": (-0.52, 0.52),
+                "yaw": (-0.78, 0.78),
+              },
+            },
+          ],
+        },
+      ),
     }
 
   # Spawn exactly at each environment origin so the stationary target is explicit.
@@ -256,11 +387,11 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
   if not play:
     cfg.events["reset_base"].params["velocity_range"] = {
-      "x": (-0.10, 0.10),
-      "y": (-0.10, 0.10),
-      "roll": (-0.10, 0.10),
-      "pitch": (-0.10, 0.10),
-      "yaw": (-0.15, 0.15),
+      "x": (0.0, 0.0),
+      "y": (0.0, 0.0),
+      "roll": (0.0, 0.0),
+      "pitch": (0.0, 0.0),
+      "yaw": (0.0, 0.0),
     }
 
   # --- Replace locomotion rewards with stationary balance rewards ---
@@ -272,6 +403,7 @@ def unitree_g1_lower_body_rough_env_cfg(
   ):
     cfg.rewards.pop(reward_name, None)
 
+  cfg.rewards["alive"] = RewardTermCfg(func=mdp.alive, weight=2.0)
   cfg.rewards["root_xy_drift_huber"] = RewardTermCfg(
     func=mdp.root_xy_drift_huber,
     weight=-1.5,
@@ -394,13 +526,14 @@ def unitree_g1_lower_body_rough_env_cfg(
 
   cfg.rewards["stance_geometry"] = RewardTermCfg(
     func=mdp.stance_geometry_penalty,
-    weight=-2.0,
+    weight=-8.0,
     params={
       "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
       "nominal_width": 0.22,
-      "risk_width": 0.34,
-      "max_width": 0.65,
-      "max_split": 0.65,
+      "risk_width": 0.48,
+      "max_width": 0.72,
+      "risk_split_gain": 1.15,
+      "max_split": 0.75,
     },
   )
 
@@ -416,6 +549,11 @@ def unitree_g1_lower_body_rough_env_cfg(
     func=mdp.no_foot_contact_penalty,
     weight=-5.0,
     params={"sensor_name": "feet_ground_contact"},
+  )
+  cfg.rewards["bad_body_ground_contact"] = RewardTermCfg(
+    func=mdp.self_collision_cost,
+    weight=-1.0,
+    params={"sensor_name": nonfoot_ground_cfg.name, "force_threshold": 30.0},
   )
 
   # --- Restrict joint_acc_l2 to lower body ---
@@ -462,22 +600,23 @@ def unitree_g1_lower_body_rough_env_cfg(
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("pelvis",)
   cfg.rewards["body_ang_vel"].weight = -0.15
 
-  cfg.terminations["illegal_contact"] = TerminationTermCfg(
-    func=mdp.illegal_contact,
-    params={"sensor_name": nonfoot_ground_cfg.name, "force_threshold": 10.0},
-  )
+  cfg.terminations.pop("illegal_contact", None)
 
-  # --- Stronger push disturbances (removed in play mode by base config) ---
+  # Preserve sim-to-real randomization from the base G1 task. Pushes are kept
+  # as an event term and staged by curriculum above so early learning remains
+  # focused on upper-body disturbance balance.
   if "push_robot" in cfg.events:
-    cfg.events["push_robot"].interval_range_s = (2.0, 4.0)
+    cfg.events["push_robot"].interval_range_s = (6.0, 10.0)
     cfg.events["push_robot"].params["velocity_range"] = {
-      "x": (-0.6, 0.6),
-      "y": (-0.6, 0.6),
-      "z": (-0.3, 0.3),
-      "roll": (-0.5, 0.5),
-      "pitch": (-0.5, 0.5),
-      "yaw": (-0.7, 0.7),
+      "x": (0.0, 0.0),
+      "y": (0.0, 0.0),
+      "z": (0.0, 0.0),
+      "roll": (0.0, 0.0),
+      "pitch": (0.0, 0.0),
+      "yaw": (0.0, 0.0),
     }
+  if "base_com" in cfg.events:
+    cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
   # --- Reduce angular momentum penalty ---
   # Upper body motion generates more angular momentum naturally.
@@ -509,6 +648,72 @@ def unitree_g1_lower_body_flat_env_cfg(
   for group in ("actor", "critic"):
     cfg.observations[group].terms.pop("height_scan", None)
 
-  # Keep upper-body disturbance/reward curriculum on flat terrain.
+  # Upper-body self-contact is not lower-body controllable. Keep the explicit
+  # floor-contact safety term and avoid feeding PPO reward noise from the arms.
+  cfg.rewards.pop("self_collisions", None)
+
+  if not play and "upper_body_disturbance" in cfg.curriculum:
+    stages = cfg.curriculum["upper_body_disturbance"].params["stages"]
+    for stage in stages:
+      if stage["step"] == 2400 * 48:
+        stage.update(
+          {
+            "mode_probabilities": (0.60, 0.32, 0.08, 0.0),
+            "resampling_time_range": (2.8, 5.5),
+            "random_walk_velocity_range": (0.06, 0.35),
+            "random_walk_acceleration_range": (0.15, 0.90),
+            "sinusoid_frequency_range": (0.25, 1.00),
+          }
+        )
+      if stage["step"] == 5200 * 48:
+        stage.update(
+          {
+            "mode_probabilities": (0.50, 0.34, 0.14, 0.02),
+            "random_walk_velocity_range": (0.08, 0.48),
+            "random_walk_acceleration_range": (0.20, 1.20),
+            "sinusoid_frequency_range": (0.30, 1.25),
+            "pulse_duration_range": (0.70, 1.60),
+          }
+        )
+      if stage["step"] == 8000 * 48:
+        stage.update(
+          {
+            "step": 11000 * 48,
+            "mode_probabilities": (0.32, 0.36, 0.22, 0.10),
+            "amplitude_scale": 0.80,
+            "rel_default_envs": 0.05,
+            "random_walk_velocity_range": (0.09, 0.55),
+            "random_walk_acceleration_range": (0.22, 1.30),
+            "sinusoid_frequency_range": (0.32, 1.30),
+            "pulse_duration_range": (0.75, 1.70),
+          }
+        )
+    if not any(stage["step"] == 6500 * 48 for stage in stages):
+      stages.append(
+        {
+          "step": 6500 * 48,
+          "mode_probabilities": (0.42, 0.36, 0.18, 0.04),
+          "amplitude_scale": 0.75,
+          "rel_default_envs": 0.06,
+          "random_walk_velocity_range": (0.09, 0.52),
+          "random_walk_acceleration_range": (0.22, 1.30),
+          "sinusoid_frequency_range": (0.32, 1.30),
+          "pulse_duration_range": (0.70, 1.60),
+        }
+      )
+    if not any(stage["step"] == 9000 * 48 for stage in stages):
+      stages.append(
+        {
+          "step": 9000 * 48,
+          "mode_probabilities": (0.38, 0.36, 0.20, 0.06),
+          "amplitude_scale": 0.78,
+          "rel_default_envs": 0.05,
+          "random_walk_velocity_range": (0.09, 0.55),
+          "random_walk_acceleration_range": (0.22, 1.35),
+          "sinusoid_frequency_range": (0.33, 1.35),
+          "pulse_duration_range": (0.70, 1.65),
+        }
+      )
+    stages.sort(key=lambda stage: stage["step"])
 
   return cfg

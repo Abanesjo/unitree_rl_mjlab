@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
+def alive(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Reward each non-terminal control step."""
+  return torch.ones(env.num_envs, device=env.device)
+
+
 def _whole_body_com_w(asset: Entity) -> torch.Tensor:
   root_body_id = asset.data.indexing.root_body_id
   com_w = asset.data.data.subtree_com[:, root_body_id, :]
@@ -157,10 +162,23 @@ def _support_margin_violation(
 
   point_x = torch.sum(point_xy_w * root_x, dim=1)
   point_y = torch.sum(point_xy_w * root_y, dim=1)
-  lower_x = support_min_x + margin
-  upper_x = support_max_x - margin
-  lower_y = support_min_y + margin
-  upper_y = support_max_y - margin
+
+  # No-contact environments have no finite support bounds. Collapse the
+  # interval to the point itself so the logged margin distance stays finite;
+  # the explicit no-contact penalty below handles the bad state.
+  support_min_x = torch.where(has_support, support_min_x, point_x)
+  support_max_x = torch.where(has_support, support_max_x, point_x)
+  support_min_y = torch.where(has_support, support_min_y, point_y)
+  support_max_y = torch.where(has_support, support_max_y, point_y)
+
+  # Shrinking by a margin can invert a one-foot support interval. Collapse
+  # inverted intervals to their center instead of creating artificial distance.
+  center_x = 0.5 * (support_min_x + support_max_x)
+  center_y = 0.5 * (support_min_y + support_max_y)
+  lower_x = torch.minimum(support_min_x + margin, center_x)
+  upper_x = torch.maximum(support_max_x - margin, center_x)
+  lower_y = torch.minimum(support_min_y + margin, center_y)
+  upper_y = torch.maximum(support_max_y - margin, center_y)
   outside_x = torch.relu(lower_x - point_x) + torch.relu(point_x - upper_x)
   outside_y = torch.relu(lower_y - point_y) + torch.relu(point_y - upper_y)
   violation = outside_x.square() + outside_y.square()
@@ -1014,7 +1032,11 @@ def stance_geometry_penalty(
 
   crossing_cost = torch.relu(foot_crossing_margin - (left[:, 1] - right[:, 1])).square()
   env.extras["log"]["Metrics/stance_width_mean"] = torch.mean(width)
+  env.extras["log"]["Metrics/stance_target_width_mean"] = torch.mean(target_min_width)
   env.extras["log"]["Metrics/stance_fore_aft_split_mean"] = torch.mean(split)
+  env.extras["log"]["Metrics/stance_target_fore_aft_split_mean"] = torch.mean(
+    desired_split
+  )
   return width_low_cost + width_high_cost + split_low_cost + split_high_cost + crossing_cost
 
 

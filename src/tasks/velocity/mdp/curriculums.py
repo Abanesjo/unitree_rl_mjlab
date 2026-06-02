@@ -31,11 +31,18 @@ class UpperBodyDisturbanceStage(TypedDict, total=False):
   step: int
   mode_probabilities: tuple[float, float, float, float]
   amplitude_scale: float
+  rel_default_envs: float
   resampling_time_range: tuple[float, float]
   random_walk_velocity_range: tuple[float, float]
   random_walk_acceleration_range: tuple[float, float]
   sinusoid_frequency_range: tuple[float, float]
   pulse_duration_range: tuple[float, float]
+
+
+class PushRobotStage(TypedDict, total=False):
+  step: int
+  interval_range_s: tuple[float, float]
+  velocity_range: dict[str, tuple[float, float]]
 
 
 def terrain_levels_vel(
@@ -137,4 +144,29 @@ def upper_body_disturbance(
 
   return {
     "amplitude_scale": torch.tensor(float(getattr(cfg, "amplitude_scale", 0.0))),
+  }
+
+
+def push_robot_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_name: str,
+  stages: list[PushRobotStage],
+) -> dict[str, torch.Tensor]:
+  """Stage external push randomization without removing the event term."""
+  del env_ids
+  event_cfg = env.event_manager.get_term_cfg(event_name)
+  for stage in stages:
+    if env.common_step_counter > stage["step"]:
+      if "interval_range_s" in stage:
+        event_cfg.interval_range_s = stage["interval_range_s"]
+      if "velocity_range" in stage:
+        event_cfg.params["velocity_range"] = stage["velocity_range"]
+
+  velocity_range = event_cfg.params.get("velocity_range", {})
+  max_abs = 0.0
+  for bounds in velocity_range.values():
+    max_abs = max(max_abs, abs(float(bounds[0])), abs(float(bounds[1])))
+  return {
+    "max_velocity_range": torch.tensor(max_abs, device=env.device),
   }
