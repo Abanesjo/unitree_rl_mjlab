@@ -329,7 +329,7 @@ def unitree_g1_lower_body_rough_env_cfg(
               },
             },
             {
-              "step": 14000 * 48,
+              "step": 12000 * 48,
               "interval_range_s": (8.0, 12.0),
               "velocity_range": {
                 "x": (-0.06, 0.06),
@@ -341,7 +341,7 @@ def unitree_g1_lower_body_rough_env_cfg(
               },
             },
             {
-              "step": 18000 * 48,
+              "step": 13500 * 48,
               "interval_range_s": (6.0, 10.0),
               "velocity_range": {
                 "x": (-0.15, 0.15),
@@ -353,7 +353,31 @@ def unitree_g1_lower_body_rough_env_cfg(
               },
             },
             {
-              "step": 21000 * 48,
+              "step": 13700 * 48,
+              "interval_range_s": (5.0, 8.0),
+              "velocity_range": {
+                "x": (-0.22, 0.22),
+                "y": (-0.22, 0.22),
+                "z": (-0.08, 0.08),
+                "roll": (-0.18, 0.18),
+                "pitch": (-0.18, 0.18),
+                "yaw": (-0.28, 0.28),
+              },
+            },
+            {
+              "step": 14200 * 48,
+              "interval_range_s": (5.0, 8.0),
+              "velocity_range": {
+                "x": (-0.25, 0.25),
+                "y": (-0.25, 0.25),
+                "z": (-0.10, 0.10),
+                "roll": (-0.21, 0.21),
+                "pitch": (-0.21, 0.21),
+                "yaw": (-0.32, 0.32),
+              },
+            },
+            {
+              "step": 14800 * 48,
               "interval_range_s": (4.0, 7.0),
               "velocity_range": {
                 "x": (-0.30, 0.30),
@@ -365,8 +389,20 @@ def unitree_g1_lower_body_rough_env_cfg(
               },
             },
             {
-              "step": 24000 * 48,
-              "interval_range_s": (1.0, 3.0),
+              "step": 16000 * 48,
+              "interval_range_s": (3.0, 6.0),
+              "velocity_range": {
+                "x": (-0.40, 0.40),
+                "y": (-0.40, 0.40),
+                "z": (-0.20, 0.20),
+                "roll": (-0.35, 0.35),
+                "pitch": (-0.35, 0.35),
+                "yaw": (-0.50, 0.50),
+              },
+            },
+            {
+              "step": 18500 * 48,
+              "interval_range_s": (2.0, 4.0),
               "velocity_range": {
                 "x": (-0.50, 0.50),
                 "y": (-0.50, 0.50),
