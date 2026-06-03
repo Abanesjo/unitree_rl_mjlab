@@ -5,6 +5,13 @@ from __future__ import annotations
 import torch
 
 
+ACTOR_HISTORY_LENGTH = 6
+ACTOR_OBS_DIM = 630
+CRITIC_OBS_DIM = 126
+POLICY_ACTION_DIM = 15
+LOWER_BODY_ACTION_DIM = 12
+AUX_PLANAR_VELOCITY_DIM = 3
+
 G1_JOINT_NAMES = (
   "left_hip_pitch_joint",
   "left_hip_roll_joint",
@@ -74,7 +81,9 @@ def _joint_mirror_sign(name: str) -> float:
   return 1.0
 
 
-def _index_and_sign(names: tuple[str, ...], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _index_and_sign(
+  names: tuple[str, ...], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
   name_to_id = {name: i for i, name in enumerate(names)}
   indices = [name_to_id[_mirror_joint_name(name)] for name in names]
   signs = [_joint_mirror_sign(name) for name in names]
@@ -125,11 +134,16 @@ def _mirror_aux_planar_velocity(values: torch.Tensor) -> torch.Tensor:
 
 
 def _mirror_policy_actions(actions: torch.Tensor) -> torch.Tensor:
+  if actions.shape[-1] != POLICY_ACTION_DIM:
+    raise ValueError(f"Unexpected G1 lower-body action dim: {actions.shape[-1]}")
   mirrored = actions.clone()
-  if mirrored.shape[-1] >= 12:
-    mirrored[..., :12] = _mirror_lower_body_actions(mirrored[..., :12])
-  if mirrored.shape[-1] >= 15:
-    mirrored[..., 12:15] = _mirror_aux_planar_velocity(mirrored[..., 12:15])
+  mirrored[..., :LOWER_BODY_ACTION_DIM] = _mirror_lower_body_actions(
+    mirrored[..., :LOWER_BODY_ACTION_DIM]
+  )
+  aux_end = LOWER_BODY_ACTION_DIM + AUX_PLANAR_VELOCITY_DIM
+  mirrored[..., LOWER_BODY_ACTION_DIM:aux_end] = _mirror_aux_planar_velocity(
+    mirrored[..., LOWER_BODY_ACTION_DIM:aux_end]
+  )
   return mirrored
 
 
@@ -146,62 +160,74 @@ def _mirror_history(
 
 def _mirror_actor_obs(actor_obs: torch.Tensor) -> torch.Tensor:
   mirrored = actor_obs.clone()
-  if mirrored.shape[-1] not in (630, 642):
+  if mirrored.shape[-1] != ACTOR_OBS_DIM:
     raise ValueError(f"Unexpected G1 lower-body actor obs dim: {mirrored.shape[-1]}")
-  has_contact_history = mirrored.shape[-1] == 642
 
   offset = 0
   mirrored[..., offset : offset + 18] = _mirror_history(
-    actor_obs[..., offset : offset + 18], 6, 3, _mirror_axial_vectors
+    actor_obs[..., offset : offset + 18],
+    ACTOR_HISTORY_LENGTH,
+    3,
+    _mirror_axial_vectors,
   )
   offset += 18
   mirrored[..., offset : offset + 18] = _mirror_history(
-    actor_obs[..., offset : offset + 18], 6, 3, _mirror_polar_vectors
+    actor_obs[..., offset : offset + 18],
+    ACTOR_HISTORY_LENGTH,
+    3,
+    _mirror_polar_vectors,
   )
   offset += 18
   mirrored[..., offset : offset + 174] = _mirror_history(
     actor_obs[..., offset : offset + 174],
-    6,
+    ACTOR_HISTORY_LENGTH,
     29,
     lambda x: _mirror_named(x, G1_JOINT_NAMES),
   )
   offset += 174
   mirrored[..., offset : offset + 174] = _mirror_history(
     actor_obs[..., offset : offset + 174],
-    6,
+    ACTOR_HISTORY_LENGTH,
     29,
     lambda x: _mirror_named(x, G1_JOINT_NAMES),
   )
   offset += 174
   mirrored[..., offset : offset + 72] = _mirror_history(
-    actor_obs[..., offset : offset + 72], 6, 12, _mirror_lower_body_actions
+    actor_obs[..., offset : offset + 72],
+    ACTOR_HISTORY_LENGTH,
+    12,
+    _mirror_lower_body_actions,
   )
   offset += 72
   mirrored[..., offset : offset + 102] = _mirror_history(
     actor_obs[..., offset : offset + 102],
-    6,
+    ACTOR_HISTORY_LENGTH,
     17,
     lambda x: _mirror_named(x, G1_UPPER_BODY_COMMAND_NAMES),
   )
   offset += 102
   mirrored[..., offset : offset + 36] = _mirror_history(
-    actor_obs[..., offset : offset + 36], 6, 6, _mirror_feet_vectors
+    actor_obs[..., offset : offset + 36],
+    ACTOR_HISTORY_LENGTH,
+    6,
+    _mirror_feet_vectors,
   )
   offset += 36
   mirrored[..., offset : offset + 36] = _mirror_history(
-    actor_obs[..., offset : offset + 36], 6, 6, _mirror_feet_vectors
+    actor_obs[..., offset : offset + 36],
+    ACTOR_HISTORY_LENGTH,
+    6,
+    _mirror_feet_vectors,
   )
   offset += 36
-  if has_contact_history:
-    mirrored[..., offset : offset + 12] = _mirror_history(
-      actor_obs[..., offset : offset + 12], 6, 2, _mirror_feet_scalars
-    )
+  if offset != ACTOR_OBS_DIM:
+    raise RuntimeError(f"G1 lower-body actor mirror consumed {offset} dims")
   return mirrored
 
 
 def _mirror_critic_obs(critic_obs: torch.Tensor) -> torch.Tensor:
   mirrored = critic_obs.clone()
-  if mirrored.shape[-1] != 126:
+  if mirrored.shape[-1] != CRITIC_OBS_DIM:
     raise ValueError(f"Unexpected G1 lower-body critic obs dim: {mirrored.shape[-1]}")
 
   offset = 0
@@ -264,6 +290,9 @@ def _mirror_critic_obs(critic_obs: torch.Tensor) -> torch.Tensor:
   mirrored[..., offset : offset + 3] = _mirror_aux_planar_velocity(
     critic_obs[..., offset : offset + 3]
   )
+  offset += 3
+  if offset != CRITIC_OBS_DIM:
+    raise RuntimeError(f"G1 lower-body critic mirror consumed {offset} dims")
   return mirrored
 
 

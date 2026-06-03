@@ -42,79 +42,92 @@ PRESETS = {
   },
 }
 
-METRIC_KEYS = (
-  "Metrics/push_force_active_frac",
-  "Metrics/push_force_mean_n",
-  "Metrics/pelvis_tilt_deg_mean",
-  "Metrics/pelvis_ang_acc_mean",
-  "Metrics/root_xy_displacement_mean",
-  "Metrics/root_planar_speed_mean",
-  "Metrics/root_xy_drift_penalty_scale_mean",
-  "Metrics/root_xy_return_bonus_mean",
-  "Metrics/root_xy_return_stable_scale_mean",
-  "Metrics/root_xy_return_radial_velocity_mean",
-  "Metrics/stance_width_mean",
-  "Metrics/stance_fore_aft_split_mean",
-  "Metrics/stance_soft_overwidth_mean",
-  "Metrics/recovery_direction_x_abs_mean",
-  "Metrics/recovery_direction_y_abs_mean",
-  "Metrics/recovery_reach_actual_x_mean",
-  "Metrics/recovery_step_height_x_mean",
-  "Metrics/recovery_phase_supported_swing_frac",
-  "Metrics/recovery_swing_decontact_mean",
-  "Metrics/recovery_completion_fresh_contact_mean",
-  "Metrics/recovery_completion_reached_frac",
-  "Metrics/recovery_progress_bonus_mean",
-  "Metrics/recovery_progress_swing_mean",
-  "Metrics/recovery_progress_recontact_mean",
-  "Metrics/recovery_progress_recontact_frac",
-  "Metrics/recovery_progress_reach_score_mean",
-  "Metrics/recovery_progress_latched_active_frac",
-  "Metrics/recovery_progress_latched_need_mean",
-  "Metrics/recovery_progress_recontact_quality_mean",
-  "Metrics/recovery_progress_modest_recontact_mean",
-  "Metrics/recovery_progress_modest_recontact_quality_mean",
-  "Metrics/recovery_progress_modest_recontact_frac",
-  "Metrics/recovery_progress_useful_recontact_frac",
-  "Metrics/recovery_progress_stabilizing_recontact_frac",
-  "Metrics/recovery_stabilize_bonus_mean",
-  "Metrics/recovery_stabilize_active_frac",
-  "Metrics/recovery_stabilize_speed_score_mean",
-  "Metrics/low_risk_foot_motion_cost_mean",
-  "Metrics/low_risk_foot_motion_idle_scale_mean",
-  "Metrics/low_risk_foot_motion_need_mean",
-  "Metrics/low_risk_foot_need_idle_scale_mean",
-  "Metrics/low_risk_foot_return_need_mean",
-  "Metrics/low_risk_foot_airborne_frac",
-  "Metrics/low_risk_foot_takeoff_frac",
-  "Metrics/foot_symmetry_cost_mean",
-  "Metrics/foot_symmetry_usage_delta_mean",
-  "Metrics/foot_symmetry_left_pressure_mean",
-  "Metrics/foot_symmetry_right_pressure_mean",
-  "Metrics/directional_foot_choice_cost_mean",
-  "Metrics/directional_foot_choice_need_mean",
-  "Metrics/directional_foot_choice_gate_mean",
-  "Metrics/directional_foot_choice_lateral_frac",
-  "Metrics/directional_foot_choice_left_pref_frac",
-  "Metrics/directional_foot_choice_nonpref_usage_mean",
-  "Metrics/directional_foot_choice_usage_delta_mean",
-  "Metrics/directional_foot_choice_left_overused_mean",
-  "Metrics/directional_foot_choice_right_overused_mean",
-  "Metrics/directional_foot_choice_overused_nonpref_usage_mean",
-  "Metrics/underused_recovery_foot_bonus_mean",
-  "Metrics/underused_recovery_foot_need_mean",
-  "Metrics/underused_recovery_foot_gate_mean",
-  "Metrics/underused_recovery_foot_usage_delta_mean",
-  "Metrics/underused_recovery_foot_left_overused_mean",
-  "Metrics/underused_recovery_foot_right_overused_mean",
-  "Metrics/underused_recovery_foot_selected_usage_mean",
-  "Metrics/foot_airborne_left_frac",
-  "Metrics/foot_airborne_right_frac",
-  "Metrics/foot_takeoff_left_frac",
-  "Metrics/foot_takeoff_right_frac",
-  "Metrics/foot_takeoff_balance_mean",
-  "Episode_Metrics/mean_action_acc",
-)
+METRIC_GROUPS = {
+  "push": (
+    "Metrics/push_force_active_frac",
+    "Metrics/push_force_mean_n",
+  ),
+  "balance": (
+    "Metrics/pelvis_tilt_deg_mean",
+    "Metrics/pelvis_ang_acc_mean",
+    "Metrics/root_xy_displacement_mean",
+    "Metrics/root_planar_speed_mean",
+    "Episode_Metrics/mean_action_acc",
+  ),
+  "root_return": (
+    "Metrics/root_xy_drift_penalty_scale_mean",
+    "Metrics/root_xy_return_bonus_mean",
+    "Metrics/root_xy_return_stable_scale_mean",
+    "Metrics/root_xy_return_radial_velocity_mean",
+  ),
+  "stance": (
+    "Metrics/stance_width_mean",
+    "Metrics/stance_fore_aft_split_mean",
+    "Metrics/stance_soft_overwidth_mean",
+  ),
+  "recovery": (
+    "Metrics/recovery_direction_x_abs_mean",
+    "Metrics/recovery_direction_y_abs_mean",
+    "Metrics/recovery_reach_actual_x_mean",
+    "Metrics/recovery_step_height_x_mean",
+    "Metrics/recovery_phase_supported_swing_frac",
+    "Metrics/recovery_swing_decontact_mean",
+    "Metrics/recovery_completion_fresh_contact_mean",
+    "Metrics/recovery_completion_reached_frac",
+    "Metrics/recovery_progress_bonus_mean",
+    "Metrics/recovery_progress_swing_mean",
+    "Metrics/recovery_progress_recontact_mean",
+    "Metrics/recovery_progress_recontact_frac",
+    "Metrics/recovery_progress_reach_score_mean",
+    "Metrics/recovery_progress_latched_active_frac",
+    "Metrics/recovery_progress_latched_need_mean",
+    "Metrics/recovery_progress_recontact_quality_mean",
+    "Metrics/recovery_progress_modest_recontact_mean",
+    "Metrics/recovery_progress_modest_recontact_quality_mean",
+    "Metrics/recovery_progress_modest_recontact_frac",
+    "Metrics/recovery_progress_useful_recontact_frac",
+    "Metrics/recovery_progress_stabilizing_recontact_frac",
+    "Metrics/recovery_stabilize_bonus_mean",
+    "Metrics/recovery_stabilize_active_frac",
+    "Metrics/recovery_stabilize_speed_score_mean",
+  ),
+  "foot_use": (
+    "Metrics/low_risk_foot_motion_cost_mean",
+    "Metrics/low_risk_foot_motion_idle_scale_mean",
+    "Metrics/low_risk_foot_motion_need_mean",
+    "Metrics/low_risk_foot_need_idle_scale_mean",
+    "Metrics/low_risk_foot_return_need_mean",
+    "Metrics/low_risk_foot_airborne_frac",
+    "Metrics/low_risk_foot_takeoff_frac",
+    "Metrics/foot_symmetry_cost_mean",
+    "Metrics/foot_symmetry_usage_delta_mean",
+    "Metrics/foot_symmetry_left_pressure_mean",
+    "Metrics/foot_symmetry_right_pressure_mean",
+    "Metrics/directional_foot_choice_cost_mean",
+    "Metrics/directional_foot_choice_need_mean",
+    "Metrics/directional_foot_choice_gate_mean",
+    "Metrics/directional_foot_choice_lateral_frac",
+    "Metrics/directional_foot_choice_left_pref_frac",
+    "Metrics/directional_foot_choice_nonpref_usage_mean",
+    "Metrics/directional_foot_choice_usage_delta_mean",
+    "Metrics/directional_foot_choice_left_overused_mean",
+    "Metrics/directional_foot_choice_right_overused_mean",
+    "Metrics/directional_foot_choice_overused_nonpref_usage_mean",
+    "Metrics/underused_recovery_foot_bonus_mean",
+    "Metrics/underused_recovery_foot_need_mean",
+    "Metrics/underused_recovery_foot_gate_mean",
+    "Metrics/underused_recovery_foot_usage_delta_mean",
+    "Metrics/underused_recovery_foot_left_overused_mean",
+    "Metrics/underused_recovery_foot_right_overused_mean",
+    "Metrics/underused_recovery_foot_selected_usage_mean",
+    "Metrics/foot_airborne_left_frac",
+    "Metrics/foot_airborne_right_frac",
+    "Metrics/foot_takeoff_left_frac",
+    "Metrics/foot_takeoff_right_frac",
+    "Metrics/foot_takeoff_balance_mean",
+  ),
+}
+METRIC_KEYS = tuple(key for group in METRIC_GROUPS.values() for key in group)
 
 
 def _apply_eval_cfg(env_cfg, preset_name: str, num_envs: int, seed: int) -> None:
@@ -207,10 +220,15 @@ def run_one(task_id: str, checkpoint: Path, preset_name: str, num_envs: int, ste
   print(f"mean_fall_length: {mean_fall:.1f}")
   print(f"open_survivors: {(open_lengths > 0).sum().item()}/{num_envs}")
   print(f"open_length_mean: {open_lengths.float().mean().item():.1f}")
-  for key in METRIC_KEYS:
-    if metric_counts[key] == 0:
-      continue
-    print(f"{key}: {metric_sums[key] / metric_counts[key]:.4f}")
+  for group_name, keys in METRIC_GROUPS.items():
+    printed_header = False
+    for key in keys:
+      if metric_counts[key] == 0:
+        continue
+      if not printed_header:
+        print(f"[{group_name}]")
+        printed_header = True
+      print(f"{key}: {metric_sums[key] / metric_counts[key]:.4f}")
   env.close()
 
 

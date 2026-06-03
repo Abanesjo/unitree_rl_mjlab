@@ -21,6 +21,17 @@ from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
 
+G1_LOWER_BODY_TASK_ID = "Unitree-G1-LowerBody-Flat"
+G1_LOWER_BODY_SYMMETRY_CFG = {
+  "use_data_augmentation": True,
+  "use_mirror_loss": True,
+  "mirror_loss_coeff": 0.30,
+  "data_augmentation_func": (
+    "src.tasks.velocity.mdp.symmetry:g1_lower_body_mirror_augmentation"
+  ),
+}
+
+
 @dataclass(frozen=True)
 class TrainConfig:
   env: ManagerBasedRlEnvCfg
@@ -38,6 +49,14 @@ class TrainConfig:
     env_cfg = load_env_cfg(task_id)
     agent_cfg = load_rl_cfg(task_id)
     return TrainConfig(env=env_cfg, agent=agent_cfg)
+
+
+def _apply_task_algorithm_overrides(task_id: str, agent_cfg: dict) -> None:
+  if task_id != G1_LOWER_BODY_TASK_ID:
+    return
+
+  agent_cfg["algorithm"]["symmetry_cfg"] = deepcopy(G1_LOWER_BODY_SYMMETRY_CFG)
+  print("[INFO] Enabled G1 lower-body left/right symmetry augmentation.")
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
@@ -118,16 +137,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   agent_cfg = asdict(cfg.agent)
   env_cfg = asdict(cfg.env)
-  if task_id == "Unitree-G1-LowerBody-Flat":
-    agent_cfg["algorithm"]["symmetry_cfg"] = {
-      "use_data_augmentation": True,
-      "use_mirror_loss": True,
-      "mirror_loss_coeff": 0.30,
-      "data_augmentation_func": (
-        "src.tasks.velocity.mdp.symmetry:g1_lower_body_mirror_augmentation"
-      ),
-    }
-    print("[INFO] Enabled G1 lower-body left/right symmetry augmentation.")
+  _apply_task_algorithm_overrides(task_id, agent_cfg)
 
   runner_cls = load_runner_cls(task_id)
   if runner_cls is None:
