@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -117,13 +118,24 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   agent_cfg = asdict(cfg.agent)
   env_cfg = asdict(cfg.env)
+  if task_id == "Unitree-G1-LowerBody-Flat":
+    agent_cfg["algorithm"]["symmetry_cfg"] = {
+      "use_data_augmentation": True,
+      "use_mirror_loss": True,
+      "mirror_loss_coeff": 0.30,
+      "data_augmentation_func": (
+        "src.tasks.velocity.mdp.symmetry:g1_lower_body_mirror_augmentation"
+      ),
+    }
+    print("[INFO] Enabled G1 lower-body left/right symmetry augmentation.")
 
   runner_cls = load_runner_cls(task_id)
   if runner_cls is None:
     runner_cls = MjlabOnPolicyRunner
 
   runner_kwargs = {}
-  runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
+  runner_agent_cfg = deepcopy(agent_cfg)
+  runner = runner_cls(env, runner_agent_cfg, str(log_dir), device, **runner_kwargs)
 
   runner.add_git_repo_to_log(__file__)
   if resume_path is not None:

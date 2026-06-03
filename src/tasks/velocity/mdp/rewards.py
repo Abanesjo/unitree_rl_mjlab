@@ -85,6 +85,169 @@ def _balance_risk(
   return risk
 
 
+def _sagittal_biased_direction(
+  direction: torch.Tensor,
+  sagittal_bias_gain: float = 1.0,
+  lateral_suppression: float = 0.0,
+  sagittal_activation: float = 0.08,
+) -> torch.Tensor:
+  """Bias diagonal recovery directions toward fore-aft support when x demand exists."""
+  if sagittal_bias_gain == 1.0 and lateral_suppression <= 0.0:
+    return direction
+  sagittal_gate = torch.clamp(
+    torch.abs(direction[:, 0]) / max(sagittal_activation, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  lateral_scale = torch.clamp(1.0 - lateral_suppression * sagittal_gate, min=0.0)
+  return torch.stack(
+    (direction[:, 0] * sagittal_bias_gain, direction[:, 1] * lateral_scale),
+    dim=1,
+  )
+
+
+def _balanced_foot_tie_bias(
+  env: ManagerBasedRlEnv,
+  num_feet: int,
+  dtype: torch.dtype,
+  scale: float = 0.0,
+  period_s: float = 4.0,
+) -> torch.Tensor:
+  """Tiny deterministic tie-breaker that balances preferred foot across envs/time."""
+  if scale <= 0.0 or num_feet < 2:
+    return torch.zeros((env.num_envs, num_feet), device=env.device, dtype=dtype)
+  env_ids = torch.arange(env.num_envs, device=env.device)
+  phase = 0
+  if period_s > 0.0:
+    period_steps = max(1, int(round(period_s / max(env.step_dt, 1.0e-6))))
+    common_step = getattr(env, "common_step_counter", 0)
+    if torch.is_tensor(common_step):
+      common_step = int(common_step.item())
+    phase = int(common_step) // period_steps
+  env_sign = torch.where(
+    ((env_ids + phase) % 2) == 0,
+    torch.full((env.num_envs,), -1.0, device=env.device, dtype=dtype),
+    torch.full((env.num_envs,), 1.0, device=env.device, dtype=dtype),
+  )
+  foot_ids = torch.arange(num_feet, device=env.device, dtype=dtype)
+  centered_foot_ids = foot_ids - 0.5 * float(num_feet - 1)
+  return scale * env_sign.unsqueeze(1) * centered_foot_ids.unsqueeze(0)
+
+
+def _signed_extreme_with_tie_bias(
+  env: ManagerBasedRlEnv,
+  values: torch.Tensor,
+  positive: torch.Tensor,
+  scale: float = 0.0,
+  period_s: float = 4.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Select max or min per env, using a balanced bias only for near-ties."""
+  num_values = values.shape[1]
+  tie_bias = _balanced_foot_tie_bias(
+    env,
+    num_values,
+    values.dtype,
+    scale=scale,
+    period_s=period_s,
+  )
+  score = torch.where(positive.unsqueeze(1), values, -values)
+  _, selected_idx = torch.max(score + tie_bias, dim=1)
+  selected = torch.gather(values, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  signed_selected = torch.where(positive, selected, -selected)
+  return signed_selected, selected_idx
+
+
+def _directional_recovery_step_need(
+  env: ManagerBasedRlEnv,
+  asset: Entity,
+  foot_pos_b: torch.Tensor,
+  min_reach: float = 0.30,
+  max_reach: float = 0.72,
+  capture_reach_gain: float = 1.05,
+  velocity_reach_gain: float = 0.95,
+  direction_com_gain: float = 0.60,
+  direction_velocity_gain: float = 0.95,
+  direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.35,
+  lateral_suppression: float = 0.65,
+  sagittal_activation: float = 0.08,
+  risk_activation: float = 0.12,
+  target_velocity: float = 0.22,
+  need_scale: float = 0.08,
+  dynamic_need_weight: float = 0.35,
+  gravity: float = 9.81,
+  min_com_height: float = 0.30,
+  max_capture_offset: float = 0.90,
+  risk_tilt_limit: float = 0.35,
+  risk_ang_vel_limit: float = 1.5,
+  risk_planar_speed_limit: float = 0.75,
+) -> torch.Tensor:
+  """Estimate whether support-polygon recovery actually needs a swing step."""
+  com_w = _whole_body_com_w(asset)
+  rel_com_w = com_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+  rel_com_b = quat_apply_inverse(
+    asset.data.root_link_quat_w,
+    torch.cat((rel_com_w, torch.zeros(env.num_envs, 1, device=env.device)), dim=1),
+  )
+  root_lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+  omega = torch.sqrt(gravity / torch.clamp(com_w[:, 2], min=min_com_height))
+  capture_offset_b = root_lin_vel_b / omega.unsqueeze(1)
+  capture_offset_norm = torch.norm(capture_offset_b, dim=1, keepdim=True)
+  capture_offset_b = capture_offset_b * torch.clamp(
+    max_capture_offset / torch.clamp(capture_offset_norm, min=1.0e-6),
+    max=1.0,
+  )
+  rel_capture_b = rel_com_b[:, :2] + capture_offset_b
+  risk = _balance_risk(
+    asset,
+    tilt_limit=risk_tilt_limit,
+    ang_vel_limit=risk_ang_vel_limit,
+    planar_speed_limit=risk_planar_speed_limit,
+  )
+
+  direction = (
+    direction_com_gain * rel_capture_b
+    + direction_velocity_gain * root_lin_vel_b
+  )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
+  direction_norm = torch.norm(direction, dim=1)
+  risk_scale = torch.clamp(
+    (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  active = risk_scale * (direction_norm > direction_deadband).float()
+  direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+
+  foot_proj = torch.sum(foot_pos_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
+  leading_reach = torch.max(foot_proj, dim=1).values
+  capture_need = torch.abs(torch.sum(rel_capture_b * direction_unit, dim=1))
+  velocity_need = torch.relu(torch.sum(root_lin_vel_b * direction_unit, dim=1))
+  target_reach = torch.clamp(
+    min_reach + capture_reach_gain * capture_need + velocity_reach_gain * velocity_need,
+    max=max_reach,
+  )
+  raw_reach_gap = torch.relu(target_reach - leading_reach)
+  dynamic_need = torch.clamp(
+    (
+      torch.clamp(capture_need / max(min_reach, 1.0e-6), max=1.0)
+      + torch.clamp(velocity_need / max(target_velocity, 1.0e-6), max=1.0)
+    )
+    * 0.5,
+    max=1.0,
+  )
+  return active * torch.clamp(
+    raw_reach_gap / max(need_scale, 1.0e-6)
+    + dynamic_need_weight * dynamic_need,
+    max=1.0,
+  )
+
+
 def _support_margin_violation(
   env: ManagerBasedRlEnv,
   asset: Entity,
@@ -352,6 +515,8 @@ def root_xy_drift_huber(
   env: ManagerBasedRlEnv,
   deadband: float = 0.25,
   linear_width: float = 0.25,
+  risk_reduction: float = 0.0,
+  min_scale: float = 1.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """Penalize walking away while allowing local recovery steps/lunges."""
@@ -364,8 +529,58 @@ def root_xy_drift_huber(
     0.5 * excess.square() / max(linear_width, 1.0e-6),
     excess - 0.5 * linear_width,
   )
+  if risk_reduction > 0.0:
+    risk = _balance_risk(asset)
+    scale = torch.clamp(1.0 - risk_reduction * risk, min=min_scale, max=1.0)
+    cost = cost * scale
+    env.extras["log"]["Metrics/root_xy_drift_penalty_scale_mean"] = torch.mean(scale)
   env.extras["log"]["Metrics/root_xy_displacement_mean"] = torch.mean(displacement)
   return cost
+
+
+def root_xy_return_velocity_bonus(
+  env: ManagerBasedRlEnv,
+  deadband: float = 0.45,
+  displacement_width: float = 0.45,
+  target_return_speed: float = 0.35,
+  stable_risk: float = 0.35,
+  max_bonus: float = 1.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward moving back toward the origin only after balance risk has settled."""
+  asset: Entity = env.scene[asset_cfg.name]
+  xy_error = asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+  displacement = torch.norm(xy_error, dim=1)
+  direction_from_origin = xy_error / torch.clamp(displacement.unsqueeze(1), min=1.0e-6)
+  radial_velocity = torch.sum(
+    asset.data.root_link_lin_vel_w[:, :2] * direction_from_origin,
+    dim=1,
+  )
+  return_speed = torch.relu(-radial_velocity)
+  displacement_scale = torch.clamp(
+    (displacement - deadband) / max(displacement_width, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  risk = _balance_risk(asset)
+  stable_scale = torch.clamp(
+    (stable_risk - risk) / max(stable_risk, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  speed_score = torch.clamp(
+    return_speed / max(target_return_speed, 1.0e-6),
+    max=1.0,
+  )
+  bonus = max_bonus * stable_scale * displacement_scale * speed_score
+  env.extras["log"]["Metrics/root_xy_return_bonus_mean"] = torch.mean(bonus)
+  env.extras["log"]["Metrics/root_xy_return_stable_scale_mean"] = torch.mean(
+    stable_scale
+  )
+  env.extras["log"]["Metrics/root_xy_return_radial_velocity_mean"] = torch.mean(
+    radial_velocity
+  )
+  return bonus
 
 
 def root_planar_velocity_l2(
@@ -419,6 +634,51 @@ def root_planar_velocity_saturating_risk_gated(
     scale
   )
   return cost * scale
+
+
+def supported_root_planar_velocity_brake(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  speed_deadband: float = 0.45,
+  saturation_speed: float = 0.65,
+  min_contacts: float = 1.35,
+  risk_activation: float = 0.20,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize residual planar velocity once a recovery stance is supported."""
+  asset: Entity = env.scene[asset_cfg.name]
+  num_feet = len(asset_cfg.site_ids) if asset_cfg.site_ids is not None else 2
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  contact_count = torch.sum(contact, dim=1)
+  support_scale = torch.clamp(
+    (contact_count - min_contacts) / max(float(num_feet) - min_contacts, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+
+  planar_velocity = torch.cat(
+    (asset.data.root_link_lin_vel_b[:, :2], asset.data.root_link_ang_vel_b[:, 2:3]),
+    dim=1,
+  )
+  speed = torch.norm(planar_velocity, dim=1)
+  excess = torch.relu(speed - speed_deadband)
+  speed_cost = torch.square(excess) / (
+    torch.square(excess) + saturation_speed**2
+  )
+  risk = _balance_risk(asset)
+  risk_scale = torch.clamp(
+    (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  cost = speed_cost * support_scale * risk_scale
+
+  env.extras["log"]["Metrics/supported_brake_cost_mean"] = torch.mean(cost)
+  env.extras["log"]["Metrics/supported_brake_support_scale_mean"] = torch.mean(
+    support_scale
+  )
+  env.extras["log"]["Metrics/supported_brake_speed_mean"] = torch.mean(speed)
+  return cost
 
 
 def com_support_box_violation(
@@ -1029,6 +1289,582 @@ def feet_slip(
   return cost
 
 
+def low_risk_foot_motion_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  max_idle_risk: float = 0.22,
+  airborne_velocity_weight: float = 1.0,
+  airborne_height_weight: float = 12.0,
+  airborne_contact_weight: float = 0.0,
+  fresh_takeoff_weight: float = 0.0,
+  fresh_takeoff_window_s: float = 0.06,
+  height_deadband: float = 0.035,
+  ground_height: float = 0.0,
+  return_displacement_deadband: float = 0.0,
+  return_displacement_width: float = 0.50,
+  return_motion_relief: float = 0.0,
+  motion_need_threshold: float = 0.0,
+  motion_need_idle_weight: float = 1.0,
+  min_reach: float = 0.30,
+  max_reach: float = 0.72,
+  capture_reach_gain: float = 1.05,
+  velocity_reach_gain: float = 0.95,
+  direction_com_gain: float = 0.60,
+  direction_velocity_gain: float = 0.95,
+  direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.35,
+  lateral_suppression: float = 0.65,
+  sagittal_activation: float = 0.08,
+  risk_activation: float = 0.12,
+  target_velocity: float = 0.22,
+  need_scale: float = 0.08,
+  dynamic_need_weight: float = 0.35,
+  gravity: float = 9.81,
+  min_com_height: float = 0.30,
+  max_capture_offset: float = 0.90,
+  risk_tilt_limit: float = 0.35,
+  risk_ang_vel_limit: float = 1.5,
+  risk_planar_speed_limit: float = 0.75,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize airborne foot motion when recovery does not need a step."""
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+  num_feet = foot_pos_w.shape[1]
+  foot_pos_b = _foot_positions_in_root_frame(asset, asset_cfg)
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  sensor_data = contact_sensor.data
+  assert sensor_data.current_air_time is not None
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  airborne = 1.0 - contact
+  current_air_time = sensor_data.current_air_time[:, :num_feet]
+  fresh_takeoff = airborne * (current_air_time <= fresh_takeoff_window_s).float()
+
+  foot_vel_w = (
+    asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :]
+    - asset.data.root_link_lin_vel_w[:, None, :]
+  )
+  foot_speed_sq = torch.sum(torch.square(foot_vel_w), dim=-1)
+  height_excess = torch.relu(foot_pos_w[:, :, 2] - ground_height - height_deadband)
+
+  risk = _balance_risk(asset)
+  idle_scale = torch.clamp(
+    (max_idle_risk - risk) / max(max_idle_risk, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  if return_motion_relief > 0.0 and return_displacement_deadband > 0.0:
+    root_displacement = torch.norm(
+      asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2],
+      dim=1,
+    )
+    return_need = torch.clamp(
+      (root_displacement - return_displacement_deadband)
+      / max(return_displacement_width, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    idle_scale = idle_scale * torch.clamp(
+      1.0 - return_motion_relief * return_need,
+      min=0.0,
+      max=1.0,
+    )
+    env.extras["log"]["Metrics/low_risk_foot_return_need_mean"] = torch.mean(
+      return_need
+    )
+  if motion_need_threshold > 0.0:
+    motion_need = _directional_recovery_step_need(
+      env,
+      asset,
+      foot_pos_b,
+      min_reach=min_reach,
+      max_reach=max_reach,
+      capture_reach_gain=capture_reach_gain,
+      velocity_reach_gain=velocity_reach_gain,
+      direction_com_gain=direction_com_gain,
+      direction_velocity_gain=direction_velocity_gain,
+      direction_deadband=direction_deadband,
+      sagittal_bias_gain=sagittal_bias_gain,
+      lateral_suppression=lateral_suppression,
+      sagittal_activation=sagittal_activation,
+      risk_activation=risk_activation,
+      target_velocity=target_velocity,
+      need_scale=need_scale,
+      dynamic_need_weight=dynamic_need_weight,
+      gravity=gravity,
+      min_com_height=min_com_height,
+      max_capture_offset=max_capture_offset,
+      risk_tilt_limit=risk_tilt_limit,
+      risk_ang_vel_limit=risk_ang_vel_limit,
+      risk_planar_speed_limit=risk_planar_speed_limit,
+    )
+    need_idle_scale = motion_need_idle_weight * torch.clamp(
+      (motion_need_threshold - motion_need)
+      / max(motion_need_threshold, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    idle_scale = torch.maximum(idle_scale, need_idle_scale)
+    env.extras["log"]["Metrics/low_risk_foot_motion_need_mean"] = torch.mean(
+      motion_need
+    )
+    env.extras["log"]["Metrics/low_risk_foot_need_idle_scale_mean"] = torch.mean(
+      need_idle_scale
+    )
+  cost = torch.sum(
+    airborne
+    * (
+      airborne_velocity_weight * foot_speed_sq
+      + airborne_height_weight * torch.square(height_excess)
+      + airborne_contact_weight
+    ),
+    dim=1,
+  )
+  cost += fresh_takeoff_weight * torch.sum(fresh_takeoff, dim=1)
+  weighted_cost = cost * idle_scale
+  env.extras["log"]["Metrics/low_risk_foot_motion_cost_mean"] = torch.mean(
+    weighted_cost
+  )
+  env.extras["log"]["Metrics/low_risk_foot_motion_idle_scale_mean"] = torch.mean(
+    idle_scale
+  )
+  env.extras["log"]["Metrics/low_risk_foot_airborne_frac"] = torch.mean(airborne)
+  env.extras["log"]["Metrics/low_risk_foot_takeoff_frac"] = torch.mean(fresh_takeoff)
+  if num_feet >= 2:
+    left_airborne = airborne[:, 0]
+    right_airborne = airborne[:, 1]
+    left_takeoff = fresh_takeoff[:, 0]
+    right_takeoff = fresh_takeoff[:, 1]
+    env.extras["log"]["Metrics/foot_airborne_left_frac"] = torch.mean(left_airborne)
+    env.extras["log"]["Metrics/foot_airborne_right_frac"] = torch.mean(right_airborne)
+    env.extras["log"]["Metrics/foot_takeoff_left_frac"] = torch.mean(left_takeoff)
+    env.extras["log"]["Metrics/foot_takeoff_right_frac"] = torch.mean(right_takeoff)
+    env.extras["log"]["Metrics/foot_takeoff_balance_mean"] = torch.mean(
+      left_takeoff - right_takeoff
+    )
+  return weighted_cost
+
+
+def foot_takeoff_symmetry_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  airborne_weight: float = 0.25,
+  takeoff_weight: float = 1.0,
+  fresh_takeoff_window_s: float = 0.06,
+  imbalance_deadband: float = 0.02,
+  imbalance_scale: float = 0.08,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize whichever foot is over-used across the current vectorized batch."""
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+  num_feet = foot_pos_w.shape[1]
+  if num_feet < 2:
+    return torch.zeros(env.num_envs, device=env.device)
+
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  sensor_data = contact_sensor.data
+  assert sensor_data.current_air_time is not None
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  airborne = 1.0 - contact
+  current_air_time = sensor_data.current_air_time[:, :num_feet]
+  fresh_takeoff = airborne * (current_air_time <= fresh_takeoff_window_s).float()
+
+  usage = takeoff_weight * fresh_takeoff + airborne_weight * airborne
+  left_usage = usage[:, 0]
+  right_usage = usage[:, 1]
+  batch_delta = torch.mean(left_usage - right_usage).detach()
+  left_pressure = torch.clamp(
+    (batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  right_pressure = torch.clamp(
+    (-batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  cost = left_pressure * left_usage + right_pressure * right_usage
+
+  env.extras["log"]["Metrics/foot_symmetry_cost_mean"] = torch.mean(cost)
+  env.extras["log"]["Metrics/foot_symmetry_usage_delta_mean"] = batch_delta
+  env.extras["log"]["Metrics/foot_symmetry_left_pressure_mean"] = left_pressure
+  env.extras["log"]["Metrics/foot_symmetry_right_pressure_mean"] = right_pressure
+  return cost
+
+
+def directional_swing_foot_choice_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  airborne_weight: float = 0.25,
+  takeoff_weight: float = 1.0,
+  fresh_takeoff_window_s: float = 0.06,
+  need_activation: float = 0.05,
+  need_width: float = 0.35,
+  overused_pressure_weight: float = 0.0,
+  imbalance_deadband: float = 0.02,
+  imbalance_scale: float = 0.08,
+  raw_lateral_activation: float = 0.18,
+  lateral_activation: float = 0.55,
+  lateral_dominance: float = 0.85,
+  balanced_period_s: float = 3.0,
+  min_reach: float = 0.30,
+  max_reach: float = 0.72,
+  capture_reach_gain: float = 1.05,
+  velocity_reach_gain: float = 0.95,
+  direction_com_gain: float = 0.60,
+  direction_velocity_gain: float = 0.95,
+  direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.35,
+  lateral_suppression: float = 0.65,
+  sagittal_activation: float = 0.08,
+  risk_activation: float = 0.12,
+  target_velocity: float = 0.22,
+  need_scale: float = 0.08,
+  dynamic_need_weight: float = 0.35,
+  gravity: float = 9.81,
+  min_com_height: float = 0.30,
+  max_capture_offset: float = 0.90,
+  risk_tilt_limit: float = 0.35,
+  risk_ang_vel_limit: float = 1.5,
+  risk_planar_speed_limit: float = 0.75,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize recovery swing on the wrong foot for the current recovery direction."""
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_pos_b = _foot_positions_in_root_frame(asset, asset_cfg)
+  num_feet = foot_pos_b.shape[1]
+  if num_feet < 2:
+    return torch.zeros(env.num_envs, device=env.device)
+
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  sensor_data = contact_sensor.data
+  assert sensor_data.current_air_time is not None
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  airborne = 1.0 - contact
+  current_air_time = sensor_data.current_air_time[:, :num_feet]
+  fresh_takeoff = airborne * (current_air_time <= fresh_takeoff_window_s).float()
+  usage = takeoff_weight * fresh_takeoff + airborne_weight * airborne
+
+  motion_need = _directional_recovery_step_need(
+    env,
+    asset,
+    foot_pos_b,
+    min_reach=min_reach,
+    max_reach=max_reach,
+    capture_reach_gain=capture_reach_gain,
+    velocity_reach_gain=velocity_reach_gain,
+    direction_com_gain=direction_com_gain,
+    direction_velocity_gain=direction_velocity_gain,
+    direction_deadband=direction_deadband,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+    risk_activation=risk_activation,
+    target_velocity=target_velocity,
+    need_scale=need_scale,
+    dynamic_need_weight=dynamic_need_weight,
+    gravity=gravity,
+    min_com_height=min_com_height,
+    max_capture_offset=max_capture_offset,
+    risk_tilt_limit=risk_tilt_limit,
+    risk_ang_vel_limit=risk_ang_vel_limit,
+    risk_planar_speed_limit=risk_planar_speed_limit,
+  )
+
+  com_w = _whole_body_com_w(asset)
+  rel_com_w = com_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+  rel_com_b = quat_apply_inverse(
+    asset.data.root_link_quat_w,
+    torch.cat((rel_com_w, torch.zeros(env.num_envs, 1, device=env.device)), dim=1),
+  )
+  root_lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+  omega = torch.sqrt(gravity / torch.clamp(com_w[:, 2], min=min_com_height))
+  capture_offset_b = root_lin_vel_b / omega.unsqueeze(1)
+  capture_offset_norm = torch.norm(capture_offset_b, dim=1, keepdim=True)
+  capture_offset_b = capture_offset_b * torch.clamp(
+    max_capture_offset / torch.clamp(capture_offset_norm, min=1.0e-6),
+    max=1.0,
+  )
+  rel_capture_b = rel_com_b[:, :2] + capture_offset_b
+  direction = (
+    direction_com_gain * rel_capture_b
+    + direction_velocity_gain * root_lin_vel_b
+  )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
+  direction_norm = torch.norm(direction, dim=1)
+  direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+
+  raw_abs_x = torch.abs(direction[:, 0])
+  raw_abs_y = torch.abs(direction[:, 1])
+  unit_abs_y = torch.abs(direction_unit[:, 1])
+  lateral_preferred = (
+    (raw_abs_y > raw_lateral_activation)
+    & (unit_abs_y > lateral_activation)
+    & (raw_abs_y > lateral_dominance * raw_abs_x)
+  )
+  lateral_left = direction_unit[:, 1] > 0.0
+
+  balanced_bias = _balanced_foot_tie_bias(
+    env,
+    num_feet,
+    foot_pos_b.dtype,
+    scale=1.0,
+    period_s=balanced_period_s,
+  )
+  balanced_left = balanced_bias[:, 0] > balanced_bias[:, 1]
+  prefer_left = torch.where(lateral_preferred, lateral_left, balanced_left)
+  prefer_right = ~prefer_left
+  preferred = torch.stack((prefer_left, prefer_right), dim=1).float()
+
+  need_gate = torch.clamp(
+    (motion_need - need_activation) / max(need_width, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  nonpreferred_usage = torch.sum(usage * (1.0 - preferred), dim=1)
+  if overused_pressure_weight > 0.0:
+    left_usage = usage[:, 0]
+    right_usage = usage[:, 1]
+    batch_delta = torch.mean(left_usage - right_usage).detach()
+    left_overused = torch.clamp(
+      (batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    right_overused = torch.clamp(
+      (-batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    overused = torch.stack(
+      (
+        left_overused.expand_as(left_usage),
+        right_overused.expand_as(right_usage),
+      ),
+      dim=1,
+    )
+    overused_nonpreferred_usage = torch.sum(
+      usage * overused * (1.0 - preferred), dim=1
+    )
+    nonpreferred_usage = (
+      nonpreferred_usage
+      + overused_pressure_weight * overused_nonpreferred_usage
+    )
+    env.extras["log"]["Metrics/directional_foot_choice_usage_delta_mean"] = (
+      batch_delta
+    )
+    env.extras["log"]["Metrics/directional_foot_choice_left_overused_mean"] = (
+      left_overused
+    )
+    env.extras["log"]["Metrics/directional_foot_choice_right_overused_mean"] = (
+      right_overused
+    )
+    env.extras["log"][
+      "Metrics/directional_foot_choice_overused_nonpref_usage_mean"
+    ] = torch.mean(overused_nonpreferred_usage)
+  cost = need_gate * nonpreferred_usage
+
+  env.extras["log"]["Metrics/directional_foot_choice_cost_mean"] = torch.mean(cost)
+  env.extras["log"]["Metrics/directional_foot_choice_need_mean"] = torch.mean(
+    motion_need
+  )
+  env.extras["log"]["Metrics/directional_foot_choice_gate_mean"] = torch.mean(
+    need_gate
+  )
+  env.extras["log"]["Metrics/directional_foot_choice_lateral_frac"] = torch.mean(
+    lateral_preferred.float()
+  )
+  env.extras["log"]["Metrics/directional_foot_choice_left_pref_frac"] = torch.mean(
+    prefer_left.float()
+  )
+  env.extras["log"]["Metrics/directional_foot_choice_nonpref_usage_mean"] = torch.mean(
+    nonpreferred_usage
+  )
+  return cost
+
+
+def underused_recovery_foot_bonus(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  airborne_weight: float = 0.15,
+  takeoff_weight: float = 1.0,
+  fresh_takeoff_window_s: float = 0.06,
+  imbalance_deadband: float = 0.02,
+  imbalance_scale: float = 0.08,
+  need_activation: float = 0.05,
+  need_width: float = 0.35,
+  raw_lateral_activation: float = 0.18,
+  lateral_activation: float = 0.55,
+  lateral_dominance: float = 0.85,
+  balanced_period_s: float = 3.0,
+  min_reach: float = 0.30,
+  max_reach: float = 0.72,
+  capture_reach_gain: float = 1.05,
+  velocity_reach_gain: float = 0.95,
+  direction_com_gain: float = 0.60,
+  direction_velocity_gain: float = 0.95,
+  direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.35,
+  lateral_suppression: float = 0.65,
+  sagittal_activation: float = 0.08,
+  risk_activation: float = 0.12,
+  target_velocity: float = 0.22,
+  need_scale: float = 0.08,
+  dynamic_need_weight: float = 0.35,
+  gravity: float = 9.81,
+  min_com_height: float = 0.30,
+  max_capture_offset: float = 0.90,
+  risk_tilt_limit: float = 0.35,
+  risk_ang_vel_limit: float = 1.5,
+  risk_planar_speed_limit: float = 0.75,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward recovery steps with the under-used foot when a step is needed."""
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_pos_b = _foot_positions_in_root_frame(asset, asset_cfg)
+  num_feet = foot_pos_b.shape[1]
+  if num_feet < 2:
+    return torch.zeros(env.num_envs, device=env.device)
+
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  sensor_data = contact_sensor.data
+  assert sensor_data.current_air_time is not None
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  airborne = 1.0 - contact
+  current_air_time = sensor_data.current_air_time[:, :num_feet]
+  fresh_takeoff = airborne * (current_air_time <= fresh_takeoff_window_s).float()
+  usage = takeoff_weight * fresh_takeoff + airborne_weight * airborne
+
+  motion_need = _directional_recovery_step_need(
+    env,
+    asset,
+    foot_pos_b,
+    min_reach=min_reach,
+    max_reach=max_reach,
+    capture_reach_gain=capture_reach_gain,
+    velocity_reach_gain=velocity_reach_gain,
+    direction_com_gain=direction_com_gain,
+    direction_velocity_gain=direction_velocity_gain,
+    direction_deadband=direction_deadband,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+    risk_activation=risk_activation,
+    target_velocity=target_velocity,
+    need_scale=need_scale,
+    dynamic_need_weight=dynamic_need_weight,
+    gravity=gravity,
+    min_com_height=min_com_height,
+    max_capture_offset=max_capture_offset,
+    risk_tilt_limit=risk_tilt_limit,
+    risk_ang_vel_limit=risk_ang_vel_limit,
+    risk_planar_speed_limit=risk_planar_speed_limit,
+  )
+
+  com_w = _whole_body_com_w(asset)
+  rel_com_w = com_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+  rel_com_b = quat_apply_inverse(
+    asset.data.root_link_quat_w,
+    torch.cat((rel_com_w, torch.zeros(env.num_envs, 1, device=env.device)), dim=1),
+  )
+  root_lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+  omega = torch.sqrt(gravity / torch.clamp(com_w[:, 2], min=min_com_height))
+  capture_offset_b = root_lin_vel_b / omega.unsqueeze(1)
+  capture_offset_norm = torch.norm(capture_offset_b, dim=1, keepdim=True)
+  capture_offset_b = capture_offset_b * torch.clamp(
+    max_capture_offset / torch.clamp(capture_offset_norm, min=1.0e-6),
+    max=1.0,
+  )
+  rel_capture_b = rel_com_b[:, :2] + capture_offset_b
+  direction = (
+    direction_com_gain * rel_capture_b
+    + direction_velocity_gain * root_lin_vel_b
+  )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
+  direction_norm = torch.norm(direction, dim=1)
+  direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+
+  raw_abs_x = torch.abs(direction[:, 0])
+  raw_abs_y = torch.abs(direction[:, 1])
+  unit_abs_y = torch.abs(direction_unit[:, 1])
+  lateral_preferred = (
+    (raw_abs_y > raw_lateral_activation)
+    & (unit_abs_y > lateral_activation)
+    & (raw_abs_y > lateral_dominance * raw_abs_x)
+  )
+  lateral_left = direction_unit[:, 1] > 0.0
+
+  balanced_bias = _balanced_foot_tie_bias(
+    env,
+    num_feet,
+    foot_pos_b.dtype,
+    scale=1.0,
+    period_s=balanced_period_s,
+  )
+  balanced_left = balanced_bias[:, 0] > balanced_bias[:, 1]
+  prefer_left = torch.where(lateral_preferred, lateral_left, balanced_left)
+  prefer_right = ~prefer_left
+  preferred = torch.stack((prefer_left, prefer_right), dim=1).float()
+
+  left_usage = usage[:, 0]
+  right_usage = usage[:, 1]
+  batch_delta = torch.mean(left_usage - right_usage).detach()
+  left_overused = torch.clamp(
+    (batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  right_overused = torch.clamp(
+    (-batch_delta - imbalance_deadband) / max(imbalance_scale, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  underused = torch.stack(
+    (
+      right_overused.expand_as(left_usage),
+      left_overused.expand_as(right_usage),
+    ),
+    dim=1,
+  )
+  need_gate = torch.clamp(
+    (motion_need - need_activation) / max(need_width, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  selected_usage = torch.sum(usage * underused * preferred, dim=1)
+  bonus = need_gate * selected_usage
+
+  env.extras["log"]["Metrics/underused_recovery_foot_bonus_mean"] = torch.mean(bonus)
+  env.extras["log"]["Metrics/underused_recovery_foot_need_mean"] = torch.mean(
+    motion_need
+  )
+  env.extras["log"]["Metrics/underused_recovery_foot_gate_mean"] = torch.mean(
+    need_gate
+  )
+  env.extras["log"]["Metrics/underused_recovery_foot_usage_delta_mean"] = batch_delta
+  env.extras["log"]["Metrics/underused_recovery_foot_left_overused_mean"] = (
+    left_overused
+  )
+  env.extras["log"]["Metrics/underused_recovery_foot_right_overused_mean"] = (
+    right_overused
+  )
+  env.extras["log"]["Metrics/underused_recovery_foot_selected_usage_mean"] = (
+    torch.mean(selected_usage)
+  )
+  return bonus
+
+
 def soft_landing(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -1231,7 +2067,10 @@ def stance_geometry_penalty(
   env: ManagerBasedRlEnv,
   nominal_width: float = 0.22,
   risk_width: float = 0.34,
+  soft_max_width: float = 0.0,
   max_width: float = 0.65,
+  soft_overwidth_weight: float = 0.0,
+  soft_overwidth_risk_activation: float = 0.15,
   risk_split_gain: float = 0.40,
   split_velocity_gain: float = 0.0,
   risk_min_split: float = 0.0,
@@ -1266,6 +2105,19 @@ def stance_geometry_penalty(
   target_min_width = torch.clamp(target_min_width, max=max_width)
   width_low_cost = torch.relu(target_min_width - width).square()
   width_high_cost = torch.relu(width - max_width).square()
+  soft_overwidth_cost = torch.zeros_like(width)
+  if soft_max_width > 0.0 and soft_overwidth_weight > 0.0:
+    overwidth_risk = torch.clamp(
+      (risk - soft_overwidth_risk_activation)
+      / max(1.0 - soft_overwidth_risk_activation, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    soft_overwidth_cost = (
+      soft_overwidth_weight
+      * overwidth_risk
+      * torch.relu(width - soft_max_width).square()
+    )
 
   com_xy = _whole_body_com_w(asset)[:, :2]
   rel_com_w = com_xy - asset.data.root_link_pos_w[:, :2]
@@ -1294,7 +2146,17 @@ def stance_geometry_penalty(
   env.extras["log"]["Metrics/stance_target_fore_aft_split_mean"] = torch.mean(
     desired_split
   )
-  return width_low_cost + width_high_cost + split_low_cost + split_high_cost + crossing_cost
+  env.extras["log"]["Metrics/stance_soft_overwidth_mean"] = torch.mean(
+    soft_overwidth_cost
+  )
+  return (
+    width_low_cost
+    + width_high_cost
+    + soft_overwidth_cost
+    + split_low_cost
+    + split_high_cost
+    + crossing_cost
+  )
 
 
 class capture_point_reach_penalty:
@@ -1433,6 +2295,8 @@ def recovery_step_clearance_penalty(
   direction_com_gain: float = 0.50,
   direction_velocity_gain: float = 0.40,
   direction_deadband: float = 0.025,
+  foot_tie_break_scale: float = 0.0,
+  foot_tie_break_period_s: float = 4.0,
   clearance_height: float = 0.055,
   ground_height: float = 0.0,
   lateral_weight: float = 0.50,
@@ -1467,17 +2331,23 @@ def recovery_step_clearance_penalty(
   )
   foot_x = foot_pos_b[:, :, 0]
   foot_y = foot_pos_b[:, :, 1]
-  max_x, max_x_idx = torch.max(foot_x, dim=1)
-  min_x, min_x_idx = torch.min(foot_x, dim=1)
-  max_y, max_y_idx = torch.max(foot_y, dim=1)
-  min_y, min_y_idx = torch.min(foot_y, dim=1)
 
   fore_forward = direction[:, 0] >= 0.0
   lateral_left = direction[:, 1] >= 0.0
-  leading_x = torch.where(fore_forward, max_x, -min_x)
-  leading_y = torch.where(lateral_left, max_y, -min_y)
-  leading_x_idx = torch.where(fore_forward, max_x_idx, min_x_idx)
-  leading_y_idx = torch.where(lateral_left, max_y_idx, min_y_idx)
+  leading_x, leading_x_idx = _signed_extreme_with_tie_bias(
+    env,
+    foot_x,
+    fore_forward,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
+  leading_y, leading_y_idx = _signed_extreme_with_tie_bias(
+    env,
+    foot_y,
+    lateral_left,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
 
   foot_height = asset.data.site_pos_w[:, asset_cfg.site_ids, 2] - ground_height
   leading_x_height = torch.gather(foot_height, 1, leading_x_idx.unsqueeze(1)).squeeze(1)
@@ -1536,6 +2406,8 @@ def recovery_step_velocity_penalty(
   direction_com_gain: float = 0.50,
   direction_velocity_gain: float = 0.40,
   direction_deadband: float = 0.025,
+  foot_tie_break_scale: float = 0.0,
+  foot_tie_break_period_s: float = 4.0,
   min_step_velocity: float = 0.20,
   velocity_target_gain: float = 0.60,
   max_step_velocity: float = 0.55,
@@ -1583,17 +2455,23 @@ def recovery_step_velocity_penalty(
   )
   foot_x = foot_pos_b[:, :, 0]
   foot_y = foot_pos_b[:, :, 1]
-  max_x, max_x_idx = torch.max(foot_x, dim=1)
-  min_x, min_x_idx = torch.min(foot_x, dim=1)
-  max_y, max_y_idx = torch.max(foot_y, dim=1)
-  min_y, min_y_idx = torch.min(foot_y, dim=1)
 
   fore_forward = direction[:, 0] >= 0.0
   lateral_left = direction[:, 1] >= 0.0
-  leading_x = torch.where(fore_forward, max_x, -min_x)
-  leading_y = torch.where(lateral_left, max_y, -min_y)
-  leading_x_idx = torch.where(fore_forward, max_x_idx, min_x_idx)
-  leading_y_idx = torch.where(lateral_left, max_y_idx, min_y_idx)
+  leading_x, leading_x_idx = _signed_extreme_with_tie_bias(
+    env,
+    foot_x,
+    fore_forward,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
+  leading_y, leading_y_idx = _signed_extreme_with_tie_bias(
+    env,
+    foot_y,
+    lateral_left,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
 
   selected_x_vel = torch.gather(
     foot_vel_b[:, :, 0], 1, leading_x_idx.unsqueeze(1)
@@ -1658,6 +2536,11 @@ def recovery_step_contact_phase_penalty(
   direction_com_gain: float = 0.45,
   direction_velocity_gain: float = 0.55,
   direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.0,
+  lateral_suppression: float = 0.0,
+  sagittal_activation: float = 0.08,
+  foot_tie_break_scale: float = 0.0,
+  foot_tie_break_period_s: float = 4.0,
   risk_activation: float = 0.20,
   clearance_height: float = 0.045,
   min_step_velocity: float = 0.12,
@@ -1668,6 +2551,9 @@ def recovery_step_contact_phase_penalty(
   velocity_weight: float = 0.7,
   recontact_weight: float = 0.6,
   no_support_weight: float = 2.0,
+  no_swing_weight: float = 0.65,
+  need_scale: float = 0.10,
+  dynamic_need_weight: float = 0.30,
   ground_height: float = 0.0,
   gravity: float = 9.81,
   min_com_height: float = 0.30,
@@ -1714,6 +2600,12 @@ def recovery_step_contact_phase_penalty(
     direction_com_gain * rel_capture_b
     + direction_velocity_gain * root_lin_vel_b
   )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
   direction_norm = torch.norm(direction, dim=1)
   risk_scale = torch.clamp(
     (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
@@ -1722,14 +2614,17 @@ def recovery_step_contact_phase_penalty(
   )
   active = risk_scale * (direction_norm > direction_deadband).float()
   direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+  tie_bias = _balanced_foot_tie_bias(
+    env,
+    num_feet,
+    foot_pos_b.dtype,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
 
   foot_proj = torch.sum(foot_pos_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
-  leading_reach, leading_idx = torch.max(foot_proj, dim=1)
-  trailing_reach, trailing_idx = torch.min(foot_proj, dim=1)
-  selected_idx = trailing_idx
-  selected_reach = trailing_reach
-  selected_contact = torch.gather(contact, 1, selected_idx.unsqueeze(1)).squeeze(1)
-  support_contact_count = contact_count - selected_contact
+  _, leading_idx = torch.max(foot_proj + tie_bias, dim=1)
+  leading_reach = torch.gather(foot_proj, 1, leading_idx.unsqueeze(1)).squeeze(1)
 
   foot_vel_w = (
     asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :]
@@ -1742,14 +2637,8 @@ def recovery_step_contact_phase_penalty(
     root_quat_w.reshape(-1, 4), foot_vel_w.reshape(-1, 3)
   ).reshape(env.num_envs, num_feet, 3)
   foot_vel_proj = torch.sum(foot_vel_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
-  selected_velocity = torch.gather(
-    foot_vel_proj, 1, selected_idx.unsqueeze(1)
-  ).squeeze(1)
 
   foot_height = asset.data.site_pos_w[:, asset_cfg.site_ids, 2] - ground_height
-  selected_height = torch.gather(
-    foot_height, 1, selected_idx.unsqueeze(1)
-  ).squeeze(1)
 
   com_need = torch.abs(torch.sum(rel_com_b[:, :2] * direction_unit, dim=1))
   capture_need = torch.abs(torch.sum(rel_capture_b * direction_unit, dim=1))
@@ -1761,24 +2650,89 @@ def recovery_step_contact_phase_penalty(
     + velocity_reach_gain * velocity_need,
     max=max_reach,
   )
-  reach_deficit = active * torch.relu(target_reach - leading_reach)
-  needs_swing = (reach_deficit > 1.0e-4).float()
-  reached = active * (selected_reach >= (target_reach - recontact_margin)).float()
+  raw_reach_gap = torch.relu(target_reach - leading_reach)
+  dynamic_need = torch.clamp(
+    (
+      torch.clamp(capture_need / max(min_reach, 1.0e-6), max=1.0)
+      + torch.clamp(velocity_need / max(min_step_velocity, 1.0e-6), max=1.0)
+    )
+    * 0.5,
+    max=1.0,
+  )
+  step_need = active * torch.clamp(
+    raw_reach_gap / max(need_scale, 1.0e-6)
+    + dynamic_need_weight * dynamic_need,
+    max=1.0,
+  )
+  reach_deficit = active * raw_reach_gap
+  phase_need = torch.maximum(reach_deficit, 0.30 * step_need)
+  needs_swing = (step_need > 1.0e-4).float()
 
-  clearance_cost = reach_deficit * torch.relu(clearance_height - selected_height)
-  velocity_cost = reach_deficit * torch.relu(min_step_velocity - selected_velocity)
-  stuck_contact_cost = reach_deficit * selected_contact
+  support_if_swing = contact_count.unsqueeze(1) - contact
+  has_support_if_swing = (support_if_swing >= 1.0).float()
+  clearance_score = torch.clamp(
+    foot_height / max(clearance_height, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  velocity_score = torch.clamp(
+    torch.relu(foot_vel_proj) / max(min_step_velocity, 1.0e-6),
+    max=1.0,
+  )
+  lift_velocity_score = torch.clamp(
+    torch.relu(foot_vel_b[:, :, 2]) / max(min_step_velocity, 1.0e-6),
+    max=1.0,
+  )
+  decontact_score = 1.0 - contact
+  movement_signal = torch.clamp(
+    0.50 * velocity_score + 0.30 * lift_velocity_score + 0.20 * clearance_score,
+    max=1.0,
+  )
+  swing_signal = torch.clamp(
+    0.45 * decontact_score + 0.35 * lift_velocity_score + 0.20 * clearance_score,
+    max=1.0,
+  )
+  candidate_signal = has_support_if_swing * movement_signal * swing_signal
+  _, selected_idx = torch.max(candidate_signal + tie_bias, dim=1)
+  best_signal = torch.gather(
+    candidate_signal, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+  selected_reach = torch.gather(foot_proj, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_contact = torch.gather(contact, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  support_contact_count = torch.gather(
+    support_if_swing, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+  selected_height = torch.gather(foot_height, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_velocity = torch.gather(
+    foot_vel_proj, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+
+  reached_contact = torch.any(
+    (foot_proj >= (target_reach - recontact_margin).unsqueeze(1))
+    & (contact > 0.5),
+    dim=1,
+  ).float()
+  reached_airborne = torch.any(
+    (foot_proj >= (target_reach - recontact_margin).unsqueeze(1))
+    & (contact <= 0.5),
+    dim=1,
+  ).float()
+
+  initiation_cost = phase_need * torch.relu(0.45 - best_signal)
   support_cost = needs_swing * torch.relu(1.0 - support_contact_count)
-  recontact_cost = reached * (1.0 - selected_contact)
+  recontact_cost = active * reached_airborne * (1.0 - reached_contact)
   no_support_cost = active * (contact_count <= 0.0).float()
+  supported_swing = torch.max((1.0 - contact) * has_support_if_swing, dim=1).values
+  no_swing_cost = step_need * (1.0 - supported_swing)
 
   cost = (
-    clearance_weight * clearance_cost
-    + velocity_weight * velocity_cost
-    + stuck_contact_weight * stuck_contact_cost
+    clearance_weight * initiation_cost
+    + velocity_weight * initiation_cost
+    + stuck_contact_weight * initiation_cost
     + support_contact_weight * support_cost
     + recontact_weight * recontact_cost
     + no_support_weight * no_support_cost
+    + no_swing_weight * no_swing_cost
   )
 
   env.extras["log"]["Metrics/recovery_phase_target_reach_mean"] = torch.mean(
@@ -1791,6 +2745,7 @@ def recovery_step_contact_phase_penalty(
     selected_reach
   )
   env.extras["log"]["Metrics/recovery_phase_deficit_mean"] = torch.mean(reach_deficit)
+  env.extras["log"]["Metrics/recovery_phase_step_need_mean"] = torch.mean(step_need)
   env.extras["log"]["Metrics/recovery_phase_active_mean"] = torch.mean(active)
   env.extras["log"]["Metrics/recovery_phase_selected_contact_mean"] = torch.mean(
     selected_contact
@@ -1805,9 +2760,21 @@ def recovery_step_contact_phase_penalty(
     selected_velocity
   )
   env.extras["log"]["Metrics/recovery_phase_reached_frac"] = torch.mean(
-    (reached > 0.0).float()
+    reached_contact
+  )
+  env.extras["log"]["Metrics/recovery_phase_supported_swing_frac"] = torch.mean(
+    supported_swing
+  )
+  env.extras["log"]["Metrics/recovery_phase_no_swing_cost_mean"] = torch.mean(
+    no_swing_cost
   )
   env.extras["log"]["Metrics/recovery_phase_penalty_mean"] = torch.mean(cost)
+  env.extras["log"]["Metrics/recovery_direction_x_abs_mean"] = torch.mean(
+    torch.abs(direction[:, 0])
+  )
+  env.extras["log"]["Metrics/recovery_direction_y_abs_mean"] = torch.mean(
+    torch.abs(direction[:, 1])
+  )
   return cost
 
 
@@ -1821,9 +2788,18 @@ def recovery_swing_bonus(
   direction_com_gain: float = 0.60,
   direction_velocity_gain: float = 0.75,
   direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.0,
+  lateral_suppression: float = 0.0,
+  sagittal_activation: float = 0.08,
+  foot_tie_break_scale: float = 0.0,
+  foot_tie_break_period_s: float = 4.0,
   risk_activation: float = 0.12,
   target_clearance: float = 0.06,
   target_velocity: float = 0.22,
+  target_lift_velocity: float = 0.18,
+  need_scale: float = 0.10,
+  dynamic_need_weight: float = 0.35,
+  completion_progress_power: float = 2.0,
   ground_height: float = 0.0,
   gravity: float = 9.81,
   min_com_height: float = 0.30,
@@ -1869,6 +2845,12 @@ def recovery_swing_bonus(
     direction_com_gain * rel_capture_b
     + direction_velocity_gain * root_lin_vel_b
   )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
   direction_norm = torch.norm(direction, dim=1)
   risk_scale = torch.clamp(
     (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
@@ -1877,15 +2859,17 @@ def recovery_swing_bonus(
   )
   active = risk_scale * (direction_norm > direction_deadband).float()
   direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+  tie_bias = _balanced_foot_tie_bias(
+    env,
+    num_feet,
+    foot_pos_b.dtype,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
 
   foot_proj = torch.sum(foot_pos_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
-  leading_reach, leading_idx = torch.max(foot_proj, dim=1)
-  trailing_reach, trailing_idx = torch.min(foot_proj, dim=1)
-  selected_idx = trailing_idx
-  selected_reach = trailing_reach
-  selected_contact = torch.gather(contact, 1, selected_idx.unsqueeze(1)).squeeze(1)
-  support_contact_count = contact_count - selected_contact
-  has_support = (support_contact_count >= 1.0).float()
+  _, leading_idx = torch.max(foot_proj + tie_bias, dim=1)
+  leading_reach = torch.gather(foot_proj, 1, leading_idx.unsqueeze(1)).squeeze(1)
 
   foot_vel_w = (
     asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :]
@@ -1898,14 +2882,8 @@ def recovery_swing_bonus(
     root_quat_w.reshape(-1, 4), foot_vel_w.reshape(-1, 3)
   ).reshape(env.num_envs, num_feet, 3)
   foot_vel_proj = torch.sum(foot_vel_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
-  selected_velocity = torch.gather(
-    foot_vel_proj, 1, selected_idx.unsqueeze(1)
-  ).squeeze(1)
 
   foot_height = asset.data.site_pos_w[:, asset_cfg.site_ids, 2] - ground_height
-  selected_height = torch.gather(
-    foot_height, 1, selected_idx.unsqueeze(1)
-  ).squeeze(1)
 
   capture_need = torch.abs(torch.sum(rel_capture_b * direction_unit, dim=1))
   velocity_need = torch.relu(torch.sum(root_lin_vel_b * direction_unit, dim=1))
@@ -1913,27 +2891,83 @@ def recovery_swing_bonus(
     min_reach + capture_reach_gain * capture_need + velocity_reach_gain * velocity_need,
     max=max_reach,
   )
-  deficit = active * torch.relu(target_reach - leading_reach)
-  deficit_scale = torch.clamp(deficit / max(max_reach - min_reach, 1.0e-6), max=1.0)
-  clearance_score = torch.clamp(selected_height / max(target_clearance, 1.0e-6), max=1.0)
+  raw_reach_gap = torch.relu(target_reach - leading_reach)
+  dynamic_need = torch.clamp(
+    (
+      torch.clamp(capture_need / max(min_reach, 1.0e-6), max=1.0)
+      + torch.clamp(velocity_need / max(target_velocity, 1.0e-6), max=1.0)
+    )
+    * 0.5,
+    max=1.0,
+  )
+  step_need = active * torch.clamp(
+    raw_reach_gap / max(need_scale, 1.0e-6)
+    + dynamic_need_weight * dynamic_need,
+    max=1.0,
+  )
+  deficit = active * raw_reach_gap
+  support_if_swing = contact_count.unsqueeze(1) - contact
+  has_support_if_swing = (support_if_swing >= 1.0).float()
+  clearance_score = torch.clamp(
+    foot_height / max(target_clearance, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
   velocity_score = torch.clamp(
-    torch.relu(selected_velocity) / max(target_velocity, 1.0e-6), max=1.0
+    torch.relu(foot_vel_proj) / max(target_velocity, 1.0e-6),
+    max=1.0,
+  )
+  lift_velocity_score = torch.clamp(
+    torch.relu(foot_vel_b[:, :, 2]) / max(target_lift_velocity, 1.0e-6),
+    max=1.0,
   )
   progress_score = torch.clamp(
-    torch.relu(selected_reach) / torch.clamp(target_reach, min=1.0e-6),
+    torch.relu(foot_proj) / torch.clamp(target_reach.unsqueeze(1), min=1.0e-6),
     max=1.0,
   )
-  decontact_score = 1.0 - selected_contact
-  swing_signal = has_support * torch.clamp(
-    0.70 * decontact_score + 0.30 * clearance_score,
+  completion_progress = torch.clamp(
+    (foot_proj - min_reach)
+    / torch.clamp(target_reach.unsqueeze(1) - min_reach, min=1.0e-6),
+    min=0.0,
+    max=1.0,
+  ).pow(completion_progress_power)
+  decontact_score = 1.0 - contact
+  initiation_signal = has_support_if_swing * torch.clamp(
+    0.55 * decontact_score
+    + 0.20 * lift_velocity_score
+    + 0.15 * velocity_score
+    + 0.10 * clearance_score,
     max=1.0,
   )
-  bonus = deficit_scale * swing_signal * (
-    0.45 * clearance_score + 0.35 * velocity_score + 0.20 * progress_score
+  flight_signal = has_support_if_swing * decontact_score * torch.clamp(
+    0.35 * clearance_score
+    + 0.30 * velocity_score
+    + 0.20 * progress_score
+    + 0.15 * completion_progress,
+    max=1.0,
   )
+  candidate_bonus = torch.clamp(
+    0.35 * initiation_signal + 0.65 * flight_signal,
+    max=1.0,
+  )
+  _, selected_idx = torch.max(candidate_bonus + tie_bias, dim=1)
+  best_bonus = torch.gather(
+    candidate_bonus, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+  bonus = step_need * best_bonus
+  selected_reach = torch.gather(foot_proj, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_contact = torch.gather(contact, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_height = torch.gather(foot_height, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_velocity = torch.gather(
+    foot_vel_proj, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+  selected_lift_velocity = torch.gather(
+    foot_vel_b[:, :, 2], 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
 
   env.extras["log"]["Metrics/recovery_swing_bonus_mean"] = torch.mean(bonus)
   env.extras["log"]["Metrics/recovery_swing_deficit_mean"] = torch.mean(deficit)
+  env.extras["log"]["Metrics/recovery_swing_step_need_mean"] = torch.mean(step_need)
   env.extras["log"]["Metrics/recovery_swing_candidate_reach_mean"] = torch.mean(
     selected_reach
   )
@@ -1949,7 +2983,761 @@ def recovery_swing_bonus(
   env.extras["log"]["Metrics/recovery_swing_velocity_mean"] = torch.mean(
     selected_velocity
   )
+  env.extras["log"]["Metrics/recovery_swing_lift_velocity_mean"] = torch.mean(
+    selected_lift_velocity
+  )
   return bonus
+
+
+def recovery_step_completion_bonus(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  min_reach: float = 0.26,
+  max_reach: float = 0.64,
+  capture_reach_gain: float = 0.85,
+  velocity_reach_gain: float = 0.65,
+  direction_com_gain: float = 0.60,
+  direction_velocity_gain: float = 0.75,
+  direction_deadband: float = 0.04,
+  sagittal_bias_gain: float = 1.0,
+  lateral_suppression: float = 0.0,
+  sagittal_activation: float = 0.08,
+  foot_tie_break_scale: float = 0.0,
+  foot_tie_break_period_s: float = 4.0,
+  risk_activation: float = 0.12,
+  recontact_margin: float = 0.04,
+  need_scale: float = 0.10,
+  dynamic_need_weight: float = 0.35,
+  progress_power: float = 2.0,
+  complete_weight: float = 0.70,
+  progress_weight: float = 0.30,
+  min_air_time: float = 0.04,
+  max_recontact_time: float = 0.30,
+  gravity: float = 9.81,
+  min_com_height: float = 0.30,
+  max_capture_offset: float = 0.90,
+  risk_tilt_limit: float = 0.35,
+  risk_ang_vel_limit: float = 1.5,
+  risk_planar_speed_limit: float = 0.75,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward completing recovery by placing a contacted foot in the needed direction."""
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_pos_b = _foot_positions_in_root_frame(asset, asset_cfg)
+  if foot_pos_b.shape[1] < 2:
+    return torch.zeros(env.num_envs, device=env.device)
+
+  num_feet = foot_pos_b.shape[1]
+  contact = _foot_contact_mask(env, sensor_name, num_feet).float()
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  sensor_data = contact_sensor.data
+  assert sensor_data.last_air_time is not None
+  assert sensor_data.current_contact_time is not None
+  last_air_time = sensor_data.last_air_time[:, :num_feet]
+  current_contact_time = sensor_data.current_contact_time[:, :num_feet]
+  fresh_recontact = (
+    contact
+    * (last_air_time >= min_air_time).float()
+    * (current_contact_time <= max_recontact_time).float()
+  )
+
+  com_w = _whole_body_com_w(asset)
+  rel_com_w = com_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+  rel_com_b = quat_apply_inverse(
+    asset.data.root_link_quat_w,
+    torch.cat((rel_com_w, torch.zeros(env.num_envs, 1, device=env.device)), dim=1),
+  )
+  root_lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+  omega = torch.sqrt(gravity / torch.clamp(com_w[:, 2], min=min_com_height))
+  capture_offset_b = root_lin_vel_b / omega.unsqueeze(1)
+  capture_offset_norm = torch.norm(capture_offset_b, dim=1, keepdim=True)
+  capture_offset_b = capture_offset_b * torch.clamp(
+    max_capture_offset / torch.clamp(capture_offset_norm, min=1.0e-6),
+    max=1.0,
+  )
+  rel_capture_b = rel_com_b[:, :2] + capture_offset_b
+  risk = _balance_risk(
+    asset,
+    tilt_limit=risk_tilt_limit,
+    ang_vel_limit=risk_ang_vel_limit,
+    planar_speed_limit=risk_planar_speed_limit,
+  )
+
+  direction = (
+    direction_com_gain * rel_capture_b
+    + direction_velocity_gain * root_lin_vel_b
+  )
+  direction = _sagittal_biased_direction(
+    direction,
+    sagittal_bias_gain=sagittal_bias_gain,
+    lateral_suppression=lateral_suppression,
+    sagittal_activation=sagittal_activation,
+  )
+  direction_norm = torch.norm(direction, dim=1)
+  risk_scale = torch.clamp(
+    (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
+    min=0.0,
+    max=1.0,
+  )
+  active = risk_scale * (direction_norm > direction_deadband).float()
+  direction_unit = direction / torch.clamp(direction_norm.unsqueeze(1), min=1.0e-6)
+  tie_bias = _balanced_foot_tie_bias(
+    env,
+    num_feet,
+    foot_pos_b.dtype,
+    scale=foot_tie_break_scale,
+    period_s=foot_tie_break_period_s,
+  )
+
+  foot_proj = torch.sum(foot_pos_b[:, :, :2] * direction_unit[:, None, :], dim=-1)
+  _, leading_idx = torch.max(foot_proj + tie_bias, dim=1)
+  leading_reach = torch.gather(foot_proj, 1, leading_idx.unsqueeze(1)).squeeze(1)
+  capture_need = torch.abs(torch.sum(rel_capture_b * direction_unit, dim=1))
+  velocity_need = torch.relu(torch.sum(root_lin_vel_b * direction_unit, dim=1))
+  target_reach = torch.clamp(
+    min_reach + capture_reach_gain * capture_need + velocity_reach_gain * velocity_need,
+    max=max_reach,
+  )
+  raw_reach_gap = torch.relu(target_reach - leading_reach)
+  dynamic_need = torch.clamp(
+    (
+      torch.clamp(capture_need / max(min_reach, 1.0e-6), max=1.0)
+      + torch.clamp(velocity_need / max(0.22, 1.0e-6), max=1.0)
+    )
+    * 0.5,
+    max=1.0,
+  )
+  step_need = active * torch.clamp(
+    raw_reach_gap / max(need_scale, 1.0e-6)
+    + dynamic_need_weight * dynamic_need,
+    max=1.0,
+  )
+
+  contact_progress = fresh_recontact * torch.clamp(
+    (foot_proj - min_reach)
+    / torch.clamp(target_reach.unsqueeze(1) - min_reach, min=1.0e-6),
+    min=0.0,
+    max=1.0,
+  ).pow(progress_power)
+  complete_contact = fresh_recontact * (
+    foot_proj >= (target_reach - recontact_margin).unsqueeze(1)
+  ).float()
+  _, selected_idx = torch.max(contact_progress + tie_bias, dim=1)
+  best_progress = torch.gather(
+    contact_progress, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+  completed = torch.max(complete_contact, dim=1).values
+  selected_reach = torch.gather(foot_proj, 1, selected_idx.unsqueeze(1)).squeeze(1)
+  selected_contact = torch.gather(
+    fresh_recontact, 1, selected_idx.unsqueeze(1)
+  ).squeeze(1)
+
+  bonus = step_need * (
+    progress_weight * best_progress + complete_weight * completed
+  )
+
+  env.extras["log"]["Metrics/recovery_completion_bonus_mean"] = torch.mean(bonus)
+  env.extras["log"]["Metrics/recovery_completion_step_need_mean"] = torch.mean(
+    step_need
+  )
+  env.extras["log"]["Metrics/recovery_completion_progress_mean"] = torch.mean(
+    best_progress
+  )
+  env.extras["log"]["Metrics/recovery_completion_contact_mean"] = torch.mean(
+    selected_contact
+  )
+  env.extras["log"]["Metrics/recovery_completion_fresh_contact_mean"] = torch.mean(
+    fresh_recontact
+  )
+  env.extras["log"]["Metrics/recovery_completion_reached_frac"] = torch.mean(
+    completed
+  )
+  env.extras["log"]["Metrics/recovery_completion_selected_reach_mean"] = torch.mean(
+    selected_reach
+  )
+  return bonus
+
+
+class recovery_step_progress_bonus:
+  """Dense, stateful reward for moving a swing foot into recovery support."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self.prev_contact: torch.Tensor | None = None
+    self.prev_foot_proj: torch.Tensor | None = None
+    self.takeoff_reach: torch.Tensor | None = None
+    self.max_airborne_reach: torch.Tensor | None = None
+    self.recovery_active: torch.Tensor | None = None
+    self.recovery_age: torch.Tensor | None = None
+    self.latched_direction: torch.Tensor | None = None
+    self.latched_target_reach: torch.Tensor | None = None
+    self.latched_need: torch.Tensor | None = None
+    self.post_recontact_age: torch.Tensor | None = None
+    self.post_recontact_speed: torch.Tensor | None = None
+    self.post_recontact_tilt: torch.Tensor | None = None
+    self.post_recontact_risk: torch.Tensor | None = None
+    self.initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+  def _ensure_buffers(
+    self,
+    env: ManagerBasedRlEnv,
+    num_feet: int,
+    dtype: torch.dtype,
+  ) -> None:
+    shape = (env.num_envs, num_feet)
+    needs_alloc = (
+      self.prev_contact is None
+      or self.prev_contact.shape != shape
+      or self.prev_contact.device != env.device
+    )
+    if not needs_alloc:
+      return
+    self.prev_contact = torch.zeros(shape, dtype=torch.bool, device=env.device)
+    self.prev_foot_proj = torch.zeros(shape, dtype=dtype, device=env.device)
+    self.takeoff_reach = torch.zeros(shape, dtype=dtype, device=env.device)
+    self.max_airborne_reach = torch.zeros(shape, dtype=dtype, device=env.device)
+    self.recovery_active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self.recovery_age = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.latched_direction = torch.zeros(env.num_envs, 2, dtype=dtype, device=env.device)
+    self.latched_target_reach = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.latched_need = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.post_recontact_age = torch.full(
+      (env.num_envs,),
+      1.0e6,
+      dtype=dtype,
+      device=env.device,
+    )
+    self.post_recontact_speed = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.post_recontact_tilt = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.post_recontact_risk = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+    self.initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_reach: float = 0.28,
+    max_reach: float = 0.72,
+    capture_reach_gain: float = 1.00,
+    velocity_reach_gain: float = 0.90,
+    direction_com_gain: float = 0.60,
+    direction_velocity_gain: float = 0.95,
+    direction_deadband: float = 0.04,
+    sagittal_bias_gain: float = 1.0,
+    lateral_suppression: float = 0.0,
+    sagittal_activation: float = 0.08,
+    foot_tie_break_scale: float = 0.0,
+    foot_tie_break_period_s: float = 4.0,
+    risk_activation: float = 0.12,
+    target_velocity: float = 0.22,
+    target_clearance: float = 0.055,
+    progress_scale: float = 0.035,
+    advance_scale: float = 0.16,
+    need_scale: float = 0.08,
+    dynamic_need_weight: float = 0.35,
+    reach_weight: float = 0.45,
+    progress_weight: float = 0.25,
+    velocity_weight: float = 0.05,
+    airborne_progress_weight: float = 0.25,
+    recontact_weight: float = 1.80,
+    recontact_advance_weight: float = 0.70,
+    recontact_target_weight: float = 0.30,
+    modest_recontact_weight: float = 0.0,
+    modest_recontact_margin: float = 0.015,
+    modest_recontact_scale: float = 0.10,
+    modest_recontact_min_support: float = 1.5,
+    latch_need_threshold: float = 0.15,
+    release_need_threshold: float = 0.05,
+    recovery_memory_s: float = 0.70,
+    recovery_retention_risk: float = 0.22,
+    latched_need_memory: float = 0.995,
+    useful_recontact_threshold: float = 0.02,
+    stabilize_window_s: float = 0.38,
+    stabilize_weight: float = 0.35,
+    speed_improvement_scale: float = 0.35,
+    tilt_improvement_scale: float = 0.10,
+    risk_improvement_scale: float = 0.30,
+    stable_state_weight: float = 0.45,
+    speed_stable_scale: float = 0.35,
+    tilt_stable_scale: float = 0.18,
+    risk_stable_target: float = 0.35,
+    min_air_time: float = 0.04,
+    max_recontact_time: float = 0.30,
+    recontact_margin: float = 0.04,
+    ground_height: float = 0.0,
+    gravity: float = 9.81,
+    min_com_height: float = 0.30,
+    max_capture_offset: float = 0.90,
+    risk_tilt_limit: float = 0.35,
+    risk_ang_vel_limit: float = 1.5,
+    risk_planar_speed_limit: float = 0.75,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    """Reward the sequence: decontact, move outward, then recontact farther out."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_b = _foot_positions_in_root_frame(asset, asset_cfg)
+    if foot_pos_b.shape[1] < 2:
+      return torch.zeros(env.num_envs, device=env.device)
+
+    num_feet = foot_pos_b.shape[1]
+    self._ensure_buffers(env, num_feet, foot_pos_b.dtype)
+    assert self.prev_contact is not None
+    assert self.prev_foot_proj is not None
+    assert self.takeoff_reach is not None
+    assert self.max_airborne_reach is not None
+    assert self.recovery_active is not None
+    assert self.recovery_age is not None
+    assert self.latched_direction is not None
+    assert self.latched_target_reach is not None
+    assert self.latched_need is not None
+    assert self.post_recontact_age is not None
+    assert self.post_recontact_speed is not None
+    assert self.post_recontact_tilt is not None
+    assert self.post_recontact_risk is not None
+
+    contact_sensor: ContactSensor = env.scene[sensor_name]
+    sensor_data = contact_sensor.data
+    assert sensor_data.last_air_time is not None
+    assert sensor_data.current_contact_time is not None
+    current_contact_time = sensor_data.current_contact_time[:, :num_feet]
+    last_air_time = sensor_data.last_air_time[:, :num_feet]
+    contact_bool = current_contact_time > 0.0
+    contact = contact_bool.float()
+    contact_count = torch.sum(contact, dim=1)
+
+    com_w = _whole_body_com_w(asset)
+    rel_com_w = com_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+    rel_com_b = quat_apply_inverse(
+      asset.data.root_link_quat_w,
+      torch.cat((rel_com_w, torch.zeros(env.num_envs, 1, device=env.device)), dim=1),
+    )
+    root_lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+    omega = torch.sqrt(gravity / torch.clamp(com_w[:, 2], min=min_com_height))
+    capture_offset_b = root_lin_vel_b / omega.unsqueeze(1)
+    capture_offset_norm = torch.norm(capture_offset_b, dim=1, keepdim=True)
+    capture_offset_b = capture_offset_b * torch.clamp(
+      max_capture_offset / torch.clamp(capture_offset_norm, min=1.0e-6),
+      max=1.0,
+    )
+    rel_capture_b = rel_com_b[:, :2] + capture_offset_b
+    risk = _balance_risk(
+      asset,
+      tilt_limit=risk_tilt_limit,
+      ang_vel_limit=risk_ang_vel_limit,
+      planar_speed_limit=risk_planar_speed_limit,
+    )
+
+    direction = (
+      direction_com_gain * rel_capture_b
+      + direction_velocity_gain * root_lin_vel_b
+    )
+    direction = _sagittal_biased_direction(
+      direction,
+      sagittal_bias_gain=sagittal_bias_gain,
+      lateral_suppression=lateral_suppression,
+      sagittal_activation=sagittal_activation,
+    )
+    direction_norm = torch.norm(direction, dim=1)
+    risk_scale = torch.clamp(
+      (risk - risk_activation) / max(1.0 - risk_activation, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    active = risk_scale * (direction_norm > direction_deadband).float()
+    current_direction_unit = direction / torch.clamp(
+      direction_norm.unsqueeze(1), min=1.0e-6
+    )
+    current_foot_proj = torch.sum(
+      foot_pos_b[:, :, :2] * current_direction_unit[:, None, :], dim=-1
+    )
+    tie_bias = _balanced_foot_tie_bias(
+      env,
+      num_feet,
+      foot_pos_b.dtype,
+      scale=foot_tie_break_scale,
+      period_s=foot_tie_break_period_s,
+    )
+    _, leading_idx = torch.max(current_foot_proj + tie_bias, dim=1)
+    leading_reach = torch.gather(
+      current_foot_proj, 1, leading_idx.unsqueeze(1)
+    ).squeeze(1)
+
+    capture_need = torch.abs(torch.sum(rel_capture_b * current_direction_unit, dim=1))
+    velocity_need = torch.relu(torch.sum(root_lin_vel_b * current_direction_unit, dim=1))
+    target_reach = torch.clamp(
+      min_reach + capture_reach_gain * capture_need + velocity_reach_gain * velocity_need,
+      max=max_reach,
+    )
+    raw_reach_gap = torch.relu(target_reach - leading_reach)
+    dynamic_need = torch.clamp(
+      (
+        torch.clamp(capture_need / max(min_reach, 1.0e-6), max=1.0)
+        + torch.clamp(velocity_need / max(target_velocity, 1.0e-6), max=1.0)
+      )
+      * 0.5,
+      max=1.0,
+    )
+    step_need = active * torch.clamp(
+      raw_reach_gap / max(need_scale, 1.0e-6)
+      + dynamic_need_weight * dynamic_need,
+      max=1.0,
+    )
+
+    reset_mask = (env.episode_length_buf <= 1) | (~self.initialized)
+    prev_active = torch.where(
+      reset_mask,
+      torch.zeros_like(self.recovery_active),
+      self.recovery_active,
+    )
+    recovery_expired = self.recovery_age >= recovery_memory_s
+    start_recovery = (
+      (step_need > latch_need_threshold)
+      & (reset_mask | (~prev_active) | recovery_expired)
+    )
+    keep_recovery = (
+      prev_active
+      & (self.recovery_age < recovery_memory_s)
+      & ((step_need > release_need_threshold) | (risk > recovery_retention_risk))
+    )
+    recovery_active = start_recovery | keep_recovery
+    next_recovery_age = torch.where(
+      reset_mask | start_recovery,
+      torch.zeros_like(self.recovery_age),
+      torch.where(
+        recovery_active,
+        self.recovery_age + env.step_dt,
+        torch.zeros_like(self.recovery_age),
+      ),
+    )
+
+    latch_mask = reset_mask | start_recovery
+    latched_direction = torch.where(
+      latch_mask.unsqueeze(1),
+      current_direction_unit,
+      self.latched_direction,
+    )
+    latched_target_reach = torch.where(
+      latch_mask,
+      target_reach,
+      self.latched_target_reach,
+    )
+    latched_need = torch.where(
+      latch_mask,
+      step_need,
+      torch.maximum(step_need, self.latched_need * latched_need_memory),
+    )
+    latched_need = torch.where(
+      recovery_active,
+      torch.clamp(latched_need, max=1.0),
+      torch.zeros_like(latched_need),
+    )
+    episode_need = torch.where(recovery_active, latched_need, step_need)
+
+    foot_proj = torch.sum(foot_pos_b[:, :, :2] * latched_direction[:, None, :], dim=-1)
+    foot_vel_w = (
+      asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :]
+      - asset.data.root_link_lin_vel_w[:, None, :]
+    )
+    root_quat_w = asset.data.root_link_quat_w[:, None, :].expand(
+      -1, foot_vel_w.shape[1], -1
+    )
+    foot_vel_b = quat_apply_inverse(
+      root_quat_w.reshape(-1, 4), foot_vel_w.reshape(-1, 3)
+    ).reshape(env.num_envs, num_feet, 3)
+    foot_vel_proj = torch.sum(foot_vel_b[:, :, :2] * latched_direction[:, None, :], dim=-1)
+    foot_height = asset.data.site_pos_w[:, asset_cfg.site_ids, 2] - ground_height
+
+    prev_contact = torch.where(reset_mask.unsqueeze(1), contact_bool, self.prev_contact)
+    prev_foot_proj = torch.where(
+      reset_mask.unsqueeze(1),
+      foot_proj,
+      self.prev_foot_proj,
+    )
+    takeoff_reach = torch.where(
+      reset_mask.unsqueeze(1),
+      foot_proj,
+      self.takeoff_reach,
+    )
+    max_airborne_reach = torch.where(
+      reset_mask.unsqueeze(1),
+      foot_proj,
+      self.max_airborne_reach,
+    )
+
+    airborne = ~contact_bool
+    fresh_recontact = (
+      contact_bool
+      & (last_air_time >= min_air_time)
+      & (current_contact_time <= max_recontact_time)
+    )
+    active_foot_mask = recovery_active.unsqueeze(1)
+    started_airborne = prev_contact & airborne & active_foot_mask
+    fresh_recontact_active = fresh_recontact & active_foot_mask
+    support_if_swing = contact_count.unsqueeze(1) - contact
+    has_support_if_swing = (support_if_swing >= 1.0).float()
+
+    takeoff_reach = torch.where(started_airborne, foot_proj, takeoff_reach)
+    max_airborne_reach = torch.where(started_airborne, foot_proj, max_airborne_reach)
+    max_airborne_reach = torch.where(
+      airborne & active_foot_mask,
+      torch.maximum(max_airborne_reach, foot_proj),
+      max_airborne_reach,
+    )
+
+    progress_delta = torch.relu(foot_proj - prev_foot_proj)
+    progress_score = torch.clamp(
+      progress_delta / max(progress_scale, 1.0e-6),
+      max=1.0,
+    )
+    velocity_score = torch.clamp(
+      torch.relu(foot_vel_proj) / max(target_velocity, 1.0e-6),
+      max=1.0,
+    )
+    clearance_score = torch.clamp(
+      foot_height / max(target_clearance, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    airborne_advance = torch.relu(max_airborne_reach - takeoff_reach)
+    airborne_progress_score = torch.clamp(
+      airborne_advance / max(advance_scale, 1.0e-6),
+      max=1.0,
+    )
+    target_reach_2d = torch.clamp(
+      latched_target_reach.unsqueeze(1),
+      min=min_reach + 1.0e-6,
+    )
+    reach_progress_score = torch.clamp(
+      (foot_proj - min_reach) / (target_reach_2d - min_reach),
+      min=0.0,
+      max=1.0,
+    )
+
+    swing_signal = (
+      reach_weight * reach_progress_score
+      + progress_weight * progress_score
+      + velocity_weight * velocity_score * reach_progress_score
+      + airborne_progress_weight * airborne_progress_score
+    )
+    swing_reward = (
+      episode_need.unsqueeze(1)
+      * recovery_active.unsqueeze(1).float()
+      * airborne.float()
+      * has_support_if_swing
+      * clearance_score
+      * swing_signal
+    )
+
+    recontact_advance = torch.relu(foot_proj - takeoff_reach)
+    recontact_advance_score = torch.clamp(
+      recontact_advance / max(advance_scale, 1.0e-6),
+      max=1.0,
+    )
+    recontact_target_score = (
+      foot_proj >= (latched_target_reach - recontact_margin).unsqueeze(1)
+    ).float()
+    recontact_signal = (
+      recontact_advance_weight * recontact_advance_score
+      + recontact_target_weight * recontact_target_score
+    )
+    recontact_reward = (
+      episode_need.unsqueeze(1)
+      * fresh_recontact_active.float()
+      * recontact_weight
+      * recontact_signal
+    )
+    modest_recontact_score = torch.clamp(
+      (recontact_advance + modest_recontact_margin)
+      / max(modest_recontact_scale, 1.0e-6),
+      min=0.0,
+      max=1.0,
+    )
+    supported_recontact = fresh_recontact_active.float() * (
+      contact_count.unsqueeze(1) >= modest_recontact_min_support
+    ).float()
+    modest_recontact_reward = (
+      episode_need.unsqueeze(1)
+      * supported_recontact
+      * modest_recontact_weight
+      * modest_recontact_score
+    )
+
+    _, best_swing_idx = torch.max(swing_reward + tie_bias, dim=1)
+    best_swing_reward = torch.gather(
+      swing_reward, 1, best_swing_idx.unsqueeze(1)
+    ).squeeze(1)
+    total_recontact_reward = recontact_reward + modest_recontact_reward
+    _, best_recontact_idx = torch.max(total_recontact_reward + tie_bias, dim=1)
+    best_recontact_reward = torch.gather(
+      total_recontact_reward, 1, best_recontact_idx.unsqueeze(1)
+    ).squeeze(1)
+    recontact_quality = torch.max(
+      fresh_recontact_active.float() * recontact_signal,
+      dim=1,
+    ).values
+    modest_recontact_quality = torch.max(
+      supported_recontact * modest_recontact_score,
+      dim=1,
+    ).values
+
+    planar_speed = torch.norm(
+      torch.cat(
+        (root_lin_vel_b, asset.data.root_link_ang_vel_b[:, 2:3]),
+        dim=1,
+      ),
+      dim=1,
+    )
+    tilt = torch.norm(asset.data.projected_gravity_b[:, :2], dim=1)
+    useful_recontact = (recontact_quality > useful_recontact_threshold) & recovery_active
+    modest_recontact = (modest_recontact_quality > 0.0) & recovery_active
+    stabilizing_recontact = useful_recontact | modest_recontact
+    expired_post_age = torch.full_like(
+      self.post_recontact_age,
+      stabilize_window_s + env.step_dt,
+    )
+    post_recontact_age = torch.where(
+      reset_mask,
+      expired_post_age,
+      self.post_recontact_age + env.step_dt,
+    )
+    post_recontact_age = torch.where(
+      stabilizing_recontact,
+      torch.zeros_like(post_recontact_age),
+      post_recontact_age,
+    )
+    post_recontact_speed = torch.where(
+      reset_mask | stabilizing_recontact,
+      planar_speed,
+      self.post_recontact_speed,
+    )
+    post_recontact_tilt = torch.where(
+      reset_mask | stabilizing_recontact,
+      tilt,
+      self.post_recontact_tilt,
+    )
+    post_recontact_risk = torch.where(
+      reset_mask | stabilizing_recontact,
+      risk,
+      self.post_recontact_risk,
+    )
+    post_recontact_active = post_recontact_age <= stabilize_window_s
+    speed_improvement = torch.clamp(
+      torch.relu(post_recontact_speed - planar_speed)
+      / max(speed_improvement_scale, 1.0e-6),
+      max=1.0,
+    )
+    tilt_improvement = torch.clamp(
+      torch.relu(post_recontact_tilt - tilt) / max(tilt_improvement_scale, 1.0e-6),
+      max=1.0,
+    )
+    risk_improvement = torch.clamp(
+      torch.relu(post_recontact_risk - risk) / max(risk_improvement_scale, 1.0e-6),
+      max=1.0,
+    )
+    support_scale = torch.clamp(contact_count - 1.0, min=0.0, max=1.0)
+    stabilize_bonus = (
+      post_recontact_active.float()
+      * support_scale
+      * torch.clamp(
+        (1.0 - stable_state_weight)
+        * (
+          0.45 * speed_improvement
+          + 0.35 * risk_improvement
+          + 0.20 * tilt_improvement
+        )
+        + stable_state_weight
+        * (
+          0.40 * torch.exp(-torch.square(planar_speed / max(speed_stable_scale, 1.0e-6)))
+          + 0.35 * torch.exp(-torch.square(tilt / max(tilt_stable_scale, 1.0e-6)))
+          + 0.25 * torch.clamp(
+            (risk_stable_target - risk) / max(risk_stable_target, 1.0e-6),
+            min=0.0,
+            max=1.0,
+          )
+        ),
+        max=1.0,
+      )
+    )
+    bonus = best_swing_reward + best_recontact_reward + stabilize_weight * stabilize_bonus
+
+    self.prev_contact[:] = contact_bool
+    self.prev_foot_proj[:] = foot_proj
+    self.takeoff_reach[:] = takeoff_reach
+    self.max_airborne_reach[:] = torch.where(
+      contact_bool,
+      foot_proj,
+      max_airborne_reach,
+    )
+    self.recovery_active[:] = recovery_active
+    self.recovery_age[:] = next_recovery_age
+    self.latched_direction[:] = latched_direction
+    self.latched_target_reach[:] = latched_target_reach
+    self.latched_need[:] = latched_need
+    self.post_recontact_age[:] = post_recontact_age
+    self.post_recontact_speed[:] = post_recontact_speed
+    self.post_recontact_tilt[:] = post_recontact_tilt
+    self.post_recontact_risk[:] = post_recontact_risk
+    self.initialized[:] = True
+
+    env.extras["log"]["Metrics/recovery_progress_bonus_mean"] = torch.mean(bonus)
+    env.extras["log"]["Metrics/recovery_progress_swing_mean"] = torch.mean(
+      best_swing_reward
+    )
+    env.extras["log"]["Metrics/recovery_progress_recontact_mean"] = torch.mean(
+      best_recontact_reward
+    )
+    env.extras["log"]["Metrics/recovery_progress_delta_mean"] = torch.mean(
+      progress_delta
+    )
+    env.extras["log"]["Metrics/recovery_progress_airborne_advance_mean"] = torch.mean(
+      airborne_advance
+    )
+    env.extras["log"]["Metrics/recovery_progress_reach_score_mean"] = torch.mean(
+      reach_progress_score
+    )
+    env.extras["log"]["Metrics/recovery_progress_recontact_frac"] = torch.mean(
+      fresh_recontact.float()
+    )
+    env.extras["log"]["Metrics/recovery_progress_step_need_mean"] = torch.mean(
+      step_need
+    )
+    env.extras["log"]["Metrics/recovery_progress_latched_active_frac"] = torch.mean(
+      recovery_active.float()
+    )
+    env.extras["log"]["Metrics/recovery_progress_latched_need_mean"] = torch.mean(
+      latched_need
+    )
+    env.extras["log"]["Metrics/recovery_progress_latched_target_mean"] = torch.mean(
+      latched_target_reach
+    )
+    env.extras["log"]["Metrics/recovery_progress_recontact_quality_mean"] = torch.mean(
+      recontact_quality
+    )
+    env.extras["log"]["Metrics/recovery_progress_modest_recontact_mean"] = torch.mean(
+      torch.max(modest_recontact_reward, dim=1).values
+    )
+    env.extras["log"]["Metrics/recovery_progress_modest_recontact_quality_mean"] = (
+      torch.mean(modest_recontact_quality)
+    )
+    env.extras["log"]["Metrics/recovery_progress_modest_recontact_frac"] = torch.mean(
+      modest_recontact.float()
+    )
+    env.extras["log"]["Metrics/recovery_progress_useful_recontact_frac"] = torch.mean(
+      useful_recontact.float()
+    )
+    env.extras["log"]["Metrics/recovery_progress_stabilizing_recontact_frac"] = torch.mean(
+      stabilizing_recontact.float()
+    )
+    env.extras["log"]["Metrics/recovery_stabilize_bonus_mean"] = torch.mean(
+      stabilize_bonus
+    )
+    env.extras["log"]["Metrics/recovery_stabilize_active_frac"] = torch.mean(
+      post_recontact_active.float()
+    )
+    env.extras["log"]["Metrics/recovery_stabilize_speed_score_mean"] = torch.mean(
+      torch.exp(-torch.square(planar_speed / max(speed_stable_scale, 1.0e-6)))
+    )
+    return bonus
 
 
 def no_foot_contact_penalty(

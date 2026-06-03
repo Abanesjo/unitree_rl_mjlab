@@ -16,28 +16,28 @@ from mjlab.utils.torch import configure_torch_backends
 
 PRESETS = {
   "mild": {
-    "force_magnitude_range": (70.0, 110.0),
-    "duration_s": (0.12, 0.18),
+    "force_magnitude_range": (20.0, 35.0),
+    "duration_s": (0.05, 0.08),
     "cooldown_s": (4.0, 7.0),
   },
   "medium": {
-    "force_magnitude_range": (120.0, 180.0),
-    "duration_s": (0.14, 0.22),
+    "force_magnitude_range": (30.0, 45.0),
+    "duration_s": (0.06, 0.09),
     "cooldown_s": (3.0, 5.0),
   },
   "planar_recovery": {
-    "force_magnitude_range": (220.0, 320.0),
-    "duration_s": (0.16, 0.24),
+    "force_magnitude_range": (35.0, 50.0),
+    "duration_s": (0.07, 0.10),
     "cooldown_s": (2.0, 4.0),
   },
   "hard_planar_recovery": {
-    "force_magnitude_range": (300.0, 420.0),
-    "duration_s": (0.16, 0.24),
+    "force_magnitude_range": (40.0, 50.0),
+    "duration_s": (0.08, 0.12),
     "cooldown_s": (2.0, 4.0),
   },
   "full": {
-    "force_magnitude_range": (400.0, 550.0),
-    "duration_s": (0.18, 0.28),
+    "force_magnitude_range": (45.0, 50.0),
+    "duration_s": (0.09, 0.14),
     "cooldown_s": (2.0, 4.0),
   },
 }
@@ -47,10 +47,72 @@ METRIC_KEYS = (
   "Metrics/push_force_mean_n",
   "Metrics/pelvis_tilt_deg_mean",
   "Metrics/pelvis_ang_acc_mean",
+  "Metrics/root_xy_displacement_mean",
+  "Metrics/root_planar_speed_mean",
+  "Metrics/root_xy_drift_penalty_scale_mean",
+  "Metrics/root_xy_return_bonus_mean",
+  "Metrics/root_xy_return_stable_scale_mean",
+  "Metrics/root_xy_return_radial_velocity_mean",
   "Metrics/stance_width_mean",
   "Metrics/stance_fore_aft_split_mean",
+  "Metrics/stance_soft_overwidth_mean",
+  "Metrics/recovery_direction_x_abs_mean",
+  "Metrics/recovery_direction_y_abs_mean",
   "Metrics/recovery_reach_actual_x_mean",
   "Metrics/recovery_step_height_x_mean",
+  "Metrics/recovery_phase_supported_swing_frac",
+  "Metrics/recovery_swing_decontact_mean",
+  "Metrics/recovery_completion_fresh_contact_mean",
+  "Metrics/recovery_completion_reached_frac",
+  "Metrics/recovery_progress_bonus_mean",
+  "Metrics/recovery_progress_swing_mean",
+  "Metrics/recovery_progress_recontact_mean",
+  "Metrics/recovery_progress_recontact_frac",
+  "Metrics/recovery_progress_reach_score_mean",
+  "Metrics/recovery_progress_latched_active_frac",
+  "Metrics/recovery_progress_latched_need_mean",
+  "Metrics/recovery_progress_recontact_quality_mean",
+  "Metrics/recovery_progress_modest_recontact_mean",
+  "Metrics/recovery_progress_modest_recontact_quality_mean",
+  "Metrics/recovery_progress_modest_recontact_frac",
+  "Metrics/recovery_progress_useful_recontact_frac",
+  "Metrics/recovery_progress_stabilizing_recontact_frac",
+  "Metrics/recovery_stabilize_bonus_mean",
+  "Metrics/recovery_stabilize_active_frac",
+  "Metrics/recovery_stabilize_speed_score_mean",
+  "Metrics/low_risk_foot_motion_cost_mean",
+  "Metrics/low_risk_foot_motion_idle_scale_mean",
+  "Metrics/low_risk_foot_motion_need_mean",
+  "Metrics/low_risk_foot_need_idle_scale_mean",
+  "Metrics/low_risk_foot_return_need_mean",
+  "Metrics/low_risk_foot_airborne_frac",
+  "Metrics/low_risk_foot_takeoff_frac",
+  "Metrics/foot_symmetry_cost_mean",
+  "Metrics/foot_symmetry_usage_delta_mean",
+  "Metrics/foot_symmetry_left_pressure_mean",
+  "Metrics/foot_symmetry_right_pressure_mean",
+  "Metrics/directional_foot_choice_cost_mean",
+  "Metrics/directional_foot_choice_need_mean",
+  "Metrics/directional_foot_choice_gate_mean",
+  "Metrics/directional_foot_choice_lateral_frac",
+  "Metrics/directional_foot_choice_left_pref_frac",
+  "Metrics/directional_foot_choice_nonpref_usage_mean",
+  "Metrics/directional_foot_choice_usage_delta_mean",
+  "Metrics/directional_foot_choice_left_overused_mean",
+  "Metrics/directional_foot_choice_right_overused_mean",
+  "Metrics/directional_foot_choice_overused_nonpref_usage_mean",
+  "Metrics/underused_recovery_foot_bonus_mean",
+  "Metrics/underused_recovery_foot_need_mean",
+  "Metrics/underused_recovery_foot_gate_mean",
+  "Metrics/underused_recovery_foot_usage_delta_mean",
+  "Metrics/underused_recovery_foot_left_overused_mean",
+  "Metrics/underused_recovery_foot_right_overused_mean",
+  "Metrics/underused_recovery_foot_selected_usage_mean",
+  "Metrics/foot_airborne_left_frac",
+  "Metrics/foot_airborne_right_frac",
+  "Metrics/foot_takeoff_left_frac",
+  "Metrics/foot_takeoff_right_frac",
+  "Metrics/foot_takeoff_balance_mean",
   "Episode_Metrics/mean_action_acc",
 )
 
@@ -105,6 +167,8 @@ def run_one(task_id: str, checkpoint: Path, preset_name: str, num_envs: int, ste
   completed_lengths: list[float] = []
   fall_lengths: list[float] = []
   last_log = {}
+  metric_sums = {key: 0.0 for key in METRIC_KEYS}
+  metric_counts = {key: 0 for key in METRIC_KEYS}
 
   with torch.inference_mode():
     for _ in range(steps):
@@ -112,6 +176,14 @@ def run_one(task_id: str, checkpoint: Path, preset_name: str, num_envs: int, ste
       obs, _, dones, extras = env.step(actions)
       episode_lengths += 1.0
       last_log = extras.get("log", {})
+      for key in METRIC_KEYS:
+        value = last_log.get(key)
+        if value is None:
+          continue
+        if torch.is_tensor(value):
+          value = value.detach().float().mean().item()
+        metric_sums[key] += float(value)
+        metric_counts[key] += 1
       done_ids = torch.nonzero(dones, as_tuple=False).flatten()
       if done_ids.numel() == 0:
         continue
@@ -136,12 +208,9 @@ def run_one(task_id: str, checkpoint: Path, preset_name: str, num_envs: int, ste
   print(f"open_survivors: {(open_lengths > 0).sum().item()}/{num_envs}")
   print(f"open_length_mean: {open_lengths.float().mean().item():.1f}")
   for key in METRIC_KEYS:
-    value = last_log.get(key)
-    if value is None:
+    if metric_counts[key] == 0:
       continue
-    if torch.is_tensor(value):
-      value = value.detach().float().mean().item()
-    print(f"{key}: {float(value):.4f}")
+    print(f"{key}: {metric_sums[key] / metric_counts[key]:.4f}")
   env.close()
 
 
